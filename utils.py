@@ -1,264 +1,243 @@
+"""
+Utility functions for MRI segmentation preprocessing and evaluation.
+
+Provides helper routines for volume cropping, padding, resizing,
+normalization, Dice score computation, and visualization overlays.
+"""
+
 from typing import Tuple, List, Optional
+
 import numpy as np
 import numpy.typing as npt
 from medpy.filter.binary import largest_connected_component
 from skimage.exposure import rescale_intensity
 from skimage.transform import resize
-from PIL import Image
 
 
-def dsc(y_pred: npt.NDArray[np.float32],
-        y_true: npt.NDArray[np.float32],
-        lcc: bool = True,
-        epsilon: float = 1e-1) -> float:
+def dice_similarity_coefficient(prediction: npt.NDArray[np.float32],
+                                ground_truth: npt.NDArray[np.float32],
+                                apply_lcc: bool = True,
+                                epsilon: float = 1e-6) -> float:
     """
-    Calculate Dice Similarity Coefficient (DSC).
-    
-    :param y_pred: Predicted segmentation mask
-    :param y_true: Ground truth segmentation mask
-    :param lcc: If True, apply largest connected component filter to prediction
+    Calculate Dice Similarity Coefficient (DSC) between prediction and ground truth.
+
+    :param prediction: Predicted segmentation mask
+    :param ground_truth: Ground truth segmentation mask
+    :param apply_lcc: If True, retain only the largest connected component in prediction
     :param epsilon: Small constant for numerical stability
-    :return: Dice coefficient (0.0 to 1.0)
+    :return: Dice coefficient in range [0.0, 1.0]
     """
-    # Optionally binarize and keep only the largest connected component in the prediction
-    if lcc and np.any(y_pred):
-        y_pred = np.round(y_pred).astype(np.int32)
-        y_true = np.round(y_true).astype(np.int32)
-        y_pred = largest_connected_component(y_pred)
-    
-    intersection = np.sum(y_pred[y_true == 1])
-    denominator = np.sum(y_pred) + np.sum(y_true)
+    # Optionally binarize and keep only the largest connected component
+    if apply_lcc and np.any(prediction):
+        prediction = np.round(prediction).astype(np.int32)
+        ground_truth = np.round(ground_truth).astype(np.int32)
+        prediction = largest_connected_component(prediction)
 
-    # If both masks are empty, define DSC=1; if only GT has positives, define DSC=0.
-    if denominator == 0:
-        return 1.0 if np.sum(y_true) == 0 else 0.0
-    
-    return (2.0 * intersection + epsilon) / (denominator + epsilon)
+    overlap = np.sum(prediction[ground_truth == 1])
+    total = np.sum(prediction) + np.sum(ground_truth)
+
+    # Both masks empty → perfect agreement by convention
+    if total == 0:
+        return 1.0
+
+    return (2.0 * overlap + epsilon) / (total + epsilon)
 
 
-def crop_sample(x: Tuple[npt.NDArray, npt.NDArray],
-                intensity_threshold: float = 0.1) -> Tuple[npt.NDArray, npt.NDArray]:
+def crop_to_content(sample: Tuple[npt.NDArray, npt.NDArray],
+                    bg_threshold_ratio: float = 0.1) -> Tuple[npt.NDArray, npt.NDArray]:
     """
-    Crop volume to the tight bounding box that contains non-background voxels.
+    Crop volume and mask to the tight bounding box enclosing non-background voxels.
 
-    :param x: Tuple of (volume, mask) arrays
-    :param intensity_threshold: Threshold relative to max intensity for background detection
+    :param sample: Tuple of (volume, mask) arrays with shape (Z, H, W, C) and (Z, H, W)
+    :param bg_threshold_ratio: Fraction of max intensity below which voxels are treated as background
     :return: Cropped (volume, mask) tuple
     """
-    volume, mask = x
-    
-    # Threshold to remove background
-    volume_thresholded = volume.copy()
-    volume_thresholded[volume_thresholded < np.max(volume) * intensity_threshold] = 0  # suppress background voxels
+    vol, seg = sample
 
-    # Find bounding box in each dimension
-    # Z-axis (slices)
-    z_projection = np.max(volume_thresholded, axis=(1, 2, 3))
-    z_nonzero = np.nonzero(z_projection)[0]
-    z_min = np.min(z_nonzero)
-    z_max = np.max(z_nonzero) + 1
-    
-    # Y-axis (height)
-    y_projection = np.max(volume_thresholded, axis=(0, 2, 3))
-    y_nonzero = np.nonzero(y_projection)[0]
-    y_min = np.min(y_nonzero)
-    y_max = np.max(y_nonzero) + 1
-    
-    # X-axis (width)
-    x_projection = np.max(volume_thresholded, axis=(0, 1, 3))
-    x_nonzero = np.nonzero(x_projection)[0]
-    x_min = np.min(x_nonzero)
-    x_max = np.max(x_nonzero) + 1
-    
-    return (volume[z_min:z_max, y_min:y_max, x_min:x_max, mask[z_min:z_max, y_min:y_max, x_min:x_max])
+    # Suppress background voxels by thresholding
+    vol_thresh = vol.copy()
+    vol_thresh[vol_thresh < np.max(vol) * bg_threshold_ratio] = 0
+
+    # Project along each axis to find non-zero extent
+    # Slice axis (Z)
+    z_proj = np.max(vol_thresh, axis=(1, 2, 3))
+    z_nz = np.nonzero(z_proj)[0]
+    z_lo, z_hi = z_nz.min(), z_nz.max() + 1
+
+    # Height axis (Y)
+    y_proj = np.max(vol_thresh, axis=(0, 2, 3))
+    y_nz = np.nonzero(y_proj)[0]
+    y_lo, y_hi = y_nz.min(), y_nz.max() + 1
+
+    # Width axis (X)
+    x_proj = np.max(vol_thresh, axis=(0, 1, 3))
+    x_nz = np.nonzero(x_proj)[0]
+    x_lo, x_hi = x_nz.min(), x_nz.max() + 1
+
+    return (vol[z_lo:z_hi, y_lo:y_hi, x_lo:x_hi], seg[z_lo:z_hi, y_lo:y_hi, x_lo:x_hi])
 
 
-def pad_sample(x: Tuple[npt.NDArray, npt.NDArray]) -> Tuple[npt.NDArray, npt.NDArray]:
+def pad_to_square(sample: Tuple[npt.NDArray, npt.NDArray]) -> Tuple[npt.NDArray, npt.NDArray]:
     """
-    Pad volume and mask to make spatial dimensions square (H == W).
+    Pad volume and mask so that the spatial dimensions (H, W) become square.
 
-    :param x: Tuple of (volume, mask) arrays
-    :return: Padded (volume, mask) tuple
+    :param sample: Tuple of (volume, mask) arrays
+    :return: Padded (volume, mask) tuple with equal H and W
     """
-    volume, mask = x
-    height, width = volume.shape[1], volume.shape[2]
-    
-    if height == width:
-        return volume, mask
-    
-    # Calculate padding needed
-    max_dim = max(height, width)
-    diff = (max_dim - min(height, width)) / 2.0
-    
-    if height > width:
-        # Pad width
-        padding = ((0, 0), (0, 0), (int(np.floor(diff)), int(np.ceil(diff))))
+    vol, seg = sample
+    h_dim, w_dim = vol.shape[1], vol.shape[2]
+
+    if h_dim == w_dim:
+        return vol, seg
+
+    # Compute symmetric padding for the shorter axis
+    gap = (max(h_dim, w_dim) - min(h_dim, w_dim)) / 2.0
+
+    if h_dim > w_dim:
+        # Pad width dimension
+        pad_spec = ((0, 0), (0, 0), (int(np.floor(gap)), int(np.ceil(gap))))
     else:
-        # Pad height
-        padding = ((0, 0), (int(np.floor(diff)), int(np.ceil(diff))), (0, 0))
-    
-    mask = np.pad(mask, padding, mode="constant", constant_values=0)
-    
-    # Add channel dimension for volume padding
-    padding_with_channels = padding + ((0, 0))
-    volume = np.pad(volume, padding_with_channels, mode="constant", constant_values=0)
-    
-    return volume, mask
+        # Pad height dimension
+        pad_spec = ((0, 0), (int(np.floor(gap)), int(np.ceil(gap))), (0, 0))
+
+    seg = np.pad(seg, pad_spec, mode="constant", constant_values=0)
+
+    # Volume has an extra channel axis → extend the padding tuple
+    vol_pad_spec = pad_spec + ((0, 0),)
+    vol = np.pad(vol, vol_pad_spec, mode="constant", constant_values=0)
+
+    return vol, seg
 
 
-def resize_sample(x: Tuple[npt.NDArray, npt.NDArray],
-                  size: int = 256) -> Tuple[npt.NDArray, npt.NDArray]:
+def resize_volume(sample: Tuple[npt.NDArray, npt.NDArray],
+                  target_size: int = 256) -> Tuple[npt.NDArray, npt.NDArray]:
     """
-    Resize volume and mask to (D, size, size).
+    Resize spatial dimensions of volume and mask to (target_size × target_size).
 
-    :param x: Tuple of (volume, mask) arrays
-    :param size: Target spatial size for height and width
+    :param sample: Tuple of (volume, mask) arrays
+    :param target_size: Desired spatial resolution (pixels)
     :return: Resized (volume, mask) tuple
     """
-    volume, mask = x
-    num_slices, _, _, num_channels = volume.shape
-    
-    out_shape = (num_slices, size, size)
-    
-    # Resize mask with nearest neighbor interpolation
-    mask = resize(mask,
-                  output_shape=out_shape,
-                  order=0,  # nearest-neighbor (keeps binary/labels intact)
-                  mode="constant",
-                  cval=0,
-                  anti_aliasing=False,
-                  preserve_range=True)
-    
-    # Resize volume with bilinear interpolation
-    volume = resize(volume,
-                    output_shape=out_shape + (num_channels),
-                    order=1,  # bilinear interpolation for intensities
-                    mode="constant",
-                    cval=0,
-                    anti_aliasing=True,  # reduce aliasing artifacts when downsampling
-                    preserve_range=True)
+    vol, seg = sample
+    n_slices = vol.shape[0]
 
-    return volume, mask
+    # Mask: nearest-neighbour interpolation to preserve binary labels
+    seg_out_shape = (n_slices, target_size, target_size)
+    seg = resize(
+        seg,
+        output_shape=seg_out_shape,
+        order=0,
+        mode="constant",
+        cval=0,
+        anti_aliasing=False,
+    )
+
+    # Volume: bi-quadratic interpolation for smooth intensity resampling
+    vol_out_shape = (n_slices, target_size, target_size, vol.shape[3])
+    vol = resize(
+        vol,
+        output_shape=vol_out_shape,
+        order=2,
+        mode="constant",
+        cval=0,
+        anti_aliasing=False,
+    )
+
+    return vol, seg
 
 
-def normalize_volume(volume: npt.NDArray,
-                     percentile_lower: float = 10.0,
-                     percentile_upper: float = 99.0) -> npt.NDArray:
+def normalize_intensity(vol: npt.NDArray[np.float64],
+                        low_percentile: float = 10.0,
+                        high_percentile: float = 99.0) -> npt.NDArray[np.float64]:
     """
-    Normalize volume intensity using percentile scaling + per-channel z-score.
+    Channel-wise intensity normalization: percentile clipping followed by z-score standardization.
 
-    :param volume: Input volume array
-    :param percentile_lower: Lower percentile for intensity rescaling
-    :param percentile_upper: Upper percentile for intensity rescaling
-    :return: Normalized volume
+    :param vol: Volume array with shape (Z, H, W, C)
+    :param low_percentile: Lower percentile for clipping
+    :param high_percentile: Upper percentile for clipping
+    :return: Normalized volume with zero mean and unit variance per channel
     """
-    # Clip intensities to percentile range
-    p_low = np.percentile(volume, percentile_lower)
-    p_high = np.percentile(volume, percentile_upper)
-    volume = rescale_intensity(volume,
-                               in_range=(p_low, p_high),
-                               out_range=(0, 1))
-    
-    # Z-score normalization per channel
-    mean = np.mean(volume, axis=(0, 1, 2), keepdims=True)
-    std = np.std(volume, axis=(0, 1, 2), keepdims=True)
-    
-    # Avoid division by zero
-    std = np.where(std == 0, 1.0, std)
-    
-    volume = (volume - mean) / std
-    return volume
+    p_lo = np.percentile(vol, low_percentile)
+    p_hi = np.percentile(vol, high_percentile)
+    vol = rescale_intensity(vol, in_range=(p_lo, p_hi))
+
+    # Per-channel z-score normalization
+    ch_mean = np.mean(vol, axis=(0, 1, 2))
+    ch_std = np.std(vol, axis=(0, 1, 2))
+    # Guard: constant channels (e.g. all-zero after cropping) produce std=0 → NaN
+    ch_std[ch_std == 0] = 1.0
+    vol = (vol - ch_mean) / ch_std
+
+    return vol
 
 
-def gray2rgb(image: npt.NDArray) -> npt.NDArray:
+def compose_visualization(mri_slice: npt.NDArray,
+                          gt_mask: npt.NDArray,
+                          pred_mask: npt.NDArray,
+                          channel_idx: int = 1) -> List[npt.NDArray[np.uint8]]:
     """
-    Convert a grayscale (H, W) image into an RGB uint8 (H, W, 3) image.
+    Generate overlay images with prediction and ground-truth contours for a batch.
 
-    :param image: Grayscale image array (H, W)
-    :return: RGB image array (H, W, 3) with values in [0, 255]
+    :param mri_slice: Input tensor batch, shape (B, C, H, W)
+    :param gt_mask: Ground-truth masks, shape (B, 1, H, W)
+    :param pred_mask: Predicted masks, shape (B, 1, H, W)
+    :param channel_idx: Which MRI channel to display (default 1 = FLAIR)
+    :return: List of RGB overlay images as uint8 arrays
     """
-    height, width = image.shape
-    
-    # Normalize to [0, 1]
-    image = image - np.min(image)
-    image_max = np.max(image)
-    if image_max > 0:
-        image = image / image_max
-    
-    # Convert to uint8 RGB
-    channel_u8 = (image * 255).astype(np.uint8)
-    rgb_image = np.empty((height, width, 3), dtype=np.uint8)
-    rgb_image[:, :, 0] = channel_u8
-    rgb_image[:, :, 1] = channel_u8
-    rgb_image[:, :, 2] = channel_u8
-    
-    return rgb_image
+    overlays: List[npt.NDArray[np.uint8]] = []
+
+    input_np = mri_slice[:, channel_idx].cpu().numpy()
+    gt_np = gt_mask[:, 0].cpu().numpy()
+    pred_np = pred_mask[:, 0].cpu().numpy()
+
+    for i in range(input_np.shape[0]):
+        rgb = grayscale_to_rgb(np.squeeze(input_np[i]))
+        rgb = draw_contour(rgb, pred_np[i], color=[255, 0, 0])   # red = prediction
+        rgb = draw_contour(rgb, gt_np[i], color=[0, 255, 0])     # green = ground truth
+        overlays.append(rgb)
+
+    return overlays
 
 
-def outline(image: npt.NDArray,
-            mask: npt.NDArray,
-            color: List[int]) -> npt.NDArray:
+def grayscale_to_rgb(image: npt.NDArray[np.float64]) -> npt.NDArray[np.uint8]:
     """
-    Draw a 1-pixel outline of a binary mask onto an RGB image.
+    Convert a single-channel grayscale image to 3-channel RGB (uint8).
 
-    :param image: RGB image array (H, W, 3)
-    :param mask: Binary mask array (H, W)
-    :param color: RGB color as [R, G, B]
-    :return: Image with outlined mask
+    :param image: 2D grayscale array
+    :return: RGB array of shape (H, W, 3) with dtype uint8
     """
-    mask = np.round(mask).astype(np.uint8)
-    yy, xx = np.nonzero(mask)
-    
-    for y, x in zip(yy, xx):
-        # Check if pixel is on the boundary
-        y_min, y_max = max(0, y - 1), min(mask.shape[0], y + 2)
-        x_min, x_max = max(0, x - 1), min(mask.shape[1], x + 2)
-        
-        local_region = mask[y_min:y_max, x_min:x_max]
-        if 0.0 < np.mean(local_region) < 1.0:
-            image[y:y + 1, x:x + 1] = color    # paint boundary pixel
-    
+    h, w = image.shape
+
+    # Shift to non-negative range
+    image = image + np.abs(np.min(image))
+    peak = np.abs(np.max(image))
+    if peak > 0:
+        image = image / peak
+
+    rgb = np.empty((h, w, 3), dtype=np.uint8)
+    rgb[:, :, 0] = rgb[:, :, 1] = rgb[:, :, 2] = (image * 255).astype(np.uint8)
+
+    return rgb
+
+
+def draw_contour(image: npt.NDArray[np.uint8],
+                 mask: npt.NDArray[np.float64],
+                 color: List[int]) -> npt.NDArray[np.uint8]:
+    """
+    Draw the boundary contour of a binary mask onto an RGB image.
+
+    :param image: RGB image array of shape (H, W, 3)
+    :param mask: 2D mask array (will be rounded to binary)
+    :param color: RGB color list for the contour, e.g. [255, 0, 0]
+    :return: Image with contour overlay
+    """
+    binary = np.round(mask)
+    rows, cols = np.nonzero(binary)
+
+    for r, c in zip(rows, cols):
+        # Check if this pixel is on the boundary (has at least one non-mask neighbour)
+        neighbourhood = binary[max(0, r - 1): r + 2, max(0, c - 1): c + 2]
+        if 0.0 < np.mean(neighbourhood) < 1.0:
+            image[max(0, r): r + 1, max(0, c): c + 1] = color
+
     return image
-
-
-def log_images(x: "torch.Tensor",
-               y_true: "torch.Tensor",
-               y_pred: "torch.Tensor",
-               channel: int = 1) -> List[npt.NDArray]:
-    """
-    Create visualization images with prediction and ground-truth outlines.
-
-    :param x: Input images tensor (B, C, H, W)
-    :param y_true: Ground truth masks tensor (B, 1, H, W)
-    :param y_pred: Predicted masks tensor (B, 1, H, W)
-    :param channel: Which input channel to visualize
-    :return: List of RGB images with overlays
-    """
-    images = []
-    
-    x_np = x[:, channel].cpu().numpy()
-    y_true_np = y_true[:, 0].cpu().numpy()
-    y_pred_np = y_pred[:, 0].cpu().numpy()
-    
-    for i in range(x_np.shape[0]):
-        image = gray2rgb(x_np[i])
-        
-        # Add prediction outline in red
-        image = outline(image, y_pred_np[i], color=[255, 0, 0])
-        
-        # Add ground truth outline in green
-        image = outline(image, y_true_np[i], color=[0, 255, 0])
-        
-        images.append(image)
-    
-    return images
-
-
-def numpy_to_pil(image: npt.NDArray) -> Image.Image:
-    """
-    Convert a numpy uint8 RGB image to a PIL Image.
-
-    :param image: Numpy array (H, W, C) with values in [0, 255]
-    :return: PIL Image
-    """
-    return Image.fromarray(image.astype(np.uint8))uint8))
