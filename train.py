@@ -144,6 +144,8 @@ def run_training(cfg: argparse.Namespace) -> None:
     
     criterion = SoftDiceLoss()
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
+    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
     best_val_dice = 0.0
 
     logger = TensorBoardLogger(cfg.log_dir)
@@ -170,35 +172,35 @@ def run_training(cfg: argparse.Namespace) -> None:
                 targets = targets.to(device)
 
                 optimizer.zero_grad()
-
                 with torch.set_grad_enabled(phase == "train"):
-                    outputs = model(inputs)
-                    batch_loss = criterion(outputs, targets)
+                    with torch.amp.autocast(device_type=device.type,
+                                            enabled=(device.type == "cuda")):
+                        outputs = model(inputs)
+                        batch_loss = criterion(outputs, targets)
 
                     if phase == "valid":
                         running_val_loss.append(batch_loss.item())
 
-                        # Collect predictions for per-volume Dice evaluation
                         preds_np = outputs.detach().cpu().numpy()
                         val_predictions.extend(preds_np[s] for s in range(preds_np.shape[0]))
 
                         tgts_np = targets.detach().cpu().numpy()
                         val_targets.extend(tgts_np[s] for s in range(tgts_np.shape[0]))
 
-                        # Visualize sample predictions
                         is_vis_epoch = (epoch % cfg.vis_frequency == 0) or (epoch == cfg.epochs - 1)
                         if is_vis_epoch and batch_idx * cfg.batch_size < cfg.n_vis_images:
                             vis_tag = f"image/{batch_idx}"
                             n_remaining = cfg.n_vis_images - batch_idx * cfg.batch_size
-                            
+
                             logger.log_image_batch(vis_tag,
                                                    compose_visualization(inputs, targets, outputs)[:n_remaining],
                                                    global_step)
 
                     if phase == "train":
                         running_train_loss.append(batch_loss.item())
-                        batch_loss.backward()
-                        optimizer.step()
+                        scaler.scale(batch_loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
 
                 if phase == "train" and (global_step + 1) % 10 == 0:
                     _log_mean_loss(logger, running_train_loss, global_step, prefix="train/")
@@ -221,6 +223,9 @@ def run_training(cfg: argparse.Namespace) -> None:
                     torch.save(model.state_dict(), ckpt_path)
 
                 running_val_loss = []
+        
+        scheduler.step()
+        logger.log_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
 
     logger.close()
     print(f"Training complete. Best validation DSC: {best_val_dice:.4f}")
