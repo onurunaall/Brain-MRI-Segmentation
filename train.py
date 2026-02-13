@@ -138,6 +138,9 @@ def run_training(cfg: argparse.Namespace) -> None:
                       out_channels=SegDataset.num_output_channels)
     model.to(device)
 
+    if hasattr(torch, "compile"):
+        model = torch.compile(model)
+    
     criterion = SoftDiceLoss()
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
     best_val_dice = 0.0
