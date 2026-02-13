@@ -56,7 +56,8 @@ def _create_dataloaders(cfg: argparse.Namespace) -> Tuple[DataLoader, DataLoader
                               sampler=train_sampler,
                               drop_last=True,
                               num_workers=cfg.num_workers,
-                              worker_init_fn=_seed_worker)
+                              worker_init_fn=_seed_worker,
+                              pin_memory=True)
     
     val_loader = DataLoader(val_ds,
                             batch_size=cfg.batch_size,
