@@ -166,5 +166,9 @@ class MRISegmentationDataset(Dataset):
 
         return img_tensor, msk_tensor
     
+    @staticmethod
     def _slice_index_from_filename(fname: str) -> int:
-        return int(fname.split(".")[-2].split("_")[4])
+        try:
+            return int(fname.split(".")[-2].split("_")[4])
+        except (IndexError, ValueError):
+            raise ValueError(f"Cannot parse slice index from '{fname}'")
