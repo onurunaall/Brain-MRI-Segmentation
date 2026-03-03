@@ -157,9 +157,10 @@ def resize_volume(
 
     # Volume: (Z, H, W, C) → (Z, C, H, W) for torch
     vol_t = torch.from_numpy(vol.transpose(0, 3, 1, 2)).float()
+    orig_min, orig_max = vol_t.min(), vol_t.max()
     vol_t = F.interpolate(vol_t, size=(target_size, target_size),
                           mode="bicubic", align_corners=False)
-    vol_t = vol_t.clamp(min=vol_t.min(), max=vol_t.max())
+    vol_t = vol_t.clamp(min=orig_min, max=orig_max)
     vol = vol_t.numpy().transpose(0, 2, 3, 1)  # back to (Z, H, W, C)
 
     # Mask: (Z, H, W) → (Z, 1, H, W) for torch
