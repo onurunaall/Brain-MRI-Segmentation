@@ -182,9 +182,10 @@ def normalize_intensity(vol: npt.NDArray[np.float64],
     :param high_percentile: Upper percentile for clipping
     :return: Normalized volume with zero mean and unit variance per channel
     """
-    p_lo = np.percentile(vol, low_percentile)
-    p_hi = np.percentile(vol, high_percentile)
-    vol = rescale_intensity(vol, in_range=(p_lo, p_hi))
+    for c in range(vol.shape[-1]):
+      p_lo = np.percentile(vol[..., c], low_percentile)
+      p_hi = np.percentile(vol[..., c], high_percentile)
+      vol[..., c] = rescale_intensity(vol[..., c], in_range=(p_lo, p_hi))
 
     # Per-channel z-score normalization
     ch_mean = np.mean(vol, axis=(0, 1, 2))
