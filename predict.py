@@ -119,7 +119,8 @@ def _reassemble_volumes(inputs: List[np.ndarray],
 
         # Binarize prediction and retain largest connected component
         vol_pred = np.round(np.array(preds[offset: offset + n_slices])).astype(int)
-        vol_pred = largest_connected_component(vol_pred)
+        if np.any(vol_pred):
+            vol_pred = largest_connected_component(vol_pred)
 
         vol_true = np.array(targets[offset: offset + n_slices])
 
