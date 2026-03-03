@@ -124,8 +124,9 @@ class MRISegmentationDataset(Dataset):
         for _, seg in paired:
             area_per_slice = seg.sum(axis=-1).sum(axis=-1)
            
-            floor = area_per_slice.sum() * 0.1 / len(area_per_slice)
-            weights = (area_per_slice + floor) / (area_per_slice.sum() * 1.1)
+            total = area_per_slice.sum()
+            floor = total * 0.1 / max(len(area_per_slice), 1)
+            weights = (area_per_slice + floor) / max(total * 1.1, 1e-6)
             patient_slice_weights.append(weights)
 
         self.volumes = [(vol, seg[..., np.newaxis]) for vol, seg in paired]
