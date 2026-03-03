@@ -11,8 +11,7 @@ class SoftDiceLoss(nn.Module):
     (as happens with batch-level Dice) and generalises to multi-channel outputs.
     """
 
-    def __init__(self,
-                 smoothing: float = 1.0) -> None:
+    def __init__(self, smoothing: float = 1.0) -> None:
         """
         :param smoothing: Laplace smoothing constant to avoid division by zero
         """
@@ -31,6 +30,9 @@ class SoftDiceLoss(nn.Module):
         """
         assert pred.size() == target.size(), (f"Shape mismatch: pred {pred.size()} vs target {target.size()}")
 
+        pred = pred.float()
+        target = target.float()
+        
         batch_size, n_channels = pred.shape[0], pred.shape[1]
 
         # Flatten spatial dims per sample per channel → (B, C, H*W)
