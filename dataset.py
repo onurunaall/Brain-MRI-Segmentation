@@ -95,7 +95,10 @@ class MRISegmentationDataset(Dataset):
             for fname in tif_files:
                 fpath = os.path.join(dirpath, fname)
                 if "mask" in fname:
-                    msk_slices.append(imread(fpath, as_gray=True))
+                    mask = imread(fpath, as_gray=True)
+                    if mask.max() > 1:
+                        mask = (mask / 255.0).astype(np.float32)
+                    msk_slices.append(mask)
                 else:
                     img_slices.append(imread(fpath))
 
