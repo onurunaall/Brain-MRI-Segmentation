@@ -133,6 +133,7 @@ def run_training(cfg: argparse.Namespace) -> None:
     """
     _ensure_directories(cfg)
     _save_config(cfg)
+    Reproducibility.seed_everything(cfg.seed)
 
     device = torch.device("cpu" if not torch.cuda.is_available() else cfg.device)
 
@@ -146,6 +147,7 @@ def run_training(cfg: argparse.Namespace) -> None:
     )
     
     model.to(device)
+    base_model = model  # uncompiled handle: its state_dict has no "_orig_mod." prefix
 
     if hasattr(torch, "compile"):
         model = torch.compile(model)
