@@ -211,3 +211,63 @@ class _WindowAttention(nn.Module):
         attn = attn.softmax(dim=-1)
         out = (attn @ v).transpose(1, 2).reshape(bw, n, c)
         return self.proj(out)
+
+
+class _SwinBlock(nn.Module):
+    """Pre-norm Swin block: (shifted) window attention + MLP, both residual."""
+
+    def __init__(self, dim: int, num_heads: int, ws: int, shift: int, mlp_ratio: float = 4.0) -> None:
+        super().__init__()
+        self.ws = ws
+        self.shift = shift
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = _WindowAttention(dim, num_heads, ws)
+        self.norm2 = nn.LayerNorm(dim)
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
+
+    @staticmethod
+    def window_partition(x: torch.Tensor, ws: int) -> torch.Tensor:
+        """(B, H, W, C) -> (B * nW, ws*ws, C)"""
+        b, h, w, c = x.shape
+        x = x.view(b, h // ws, ws, w // ws, ws, c)
+        return x.permute(0, 1, 3, 2, 4, 5).reshape(-1, ws * ws, c)
+
+    @staticmethod
+    def window_reverse(windows: torch.Tensor, ws: int, b: int, h: int, w: int) -> torch.Tensor:
+        """(B * nW, ws*ws, C) -> (B, H, W, C)"""
+        c = windows.shape[-1]
+        x = windows.view(b, h // ws, w // ws, ws, ws, c)
+        return x.permute(0, 1, 3, 2, 4, 5).reshape(b, h, w, c)
+
+    @staticmethod
+    def shifted_window_mask(h: int, w: int, ws: int, shift: int, device: torch.device) -> torch.Tensor:
+        """(nW, ws*ws, ws*ws) mask blocking attention across regions merged by the cyclic shift."""
+        region = torch.zeros(1, h, w, 1, device=device)
+        cnt = 0
+        for hs in (slice(0, -ws), slice(-ws, -shift), slice(-shift, None)):
+            for wsl in (slice(0, -ws), slice(-ws, -shift), slice(-shift, None)):
+                region[:, hs, wsl, :] = cnt
+                cnt += 1
+        ids = _SwinBlock.window_partition(region, ws).squeeze(-1)
+        mask = ids.unsqueeze(1) - ids.unsqueeze(2)
+        return mask.masked_fill(mask != 0, -100.0).masked_fill(mask == 0, 0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, h, w, c = x.shape
+        shortcut = x
+        x = self.norm1(x)
+
+        mask = None
+        if self.shift > 0:
+            x = torch.roll(x, shifts=(-self.shift, -self.shift), dims=(1, 2))
+            mask = self.shifted_window_mask(h, w, self.ws, self.shift, x.device).to(x.dtype)
+
+        windows = self.attn(self.window_partition(x, self.ws), mask)
+        x = self.window_reverse(windows, self.ws, b, h, w)
+
+        if self.shift > 0:
+            x = torch.roll(x, shifts=(self.shift, self.shift), dims=(1, 2))
+
+        x = shortcut + x
+        return x + self.mlp(self.norm2(x))
