@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import time
 from typing import List, Tuple
 
 import numpy as np
@@ -14,7 +15,7 @@ from tb_logger import TensorBoardLogger
 from losses import SoftDiceLoss
 from augmentations import build_augmentation_pipeline
 from network import ModelFactory
-from utils import compose_visualization, dice_similarity_coefficient
+from utils import compose_visualization, dice_similarity_coefficient, Reproducibility
 
 
 def _create_dataloaders(cfg: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
@@ -31,11 +32,19 @@ def _create_dataloaders(cfg: argparse.Namespace) -> Tuple[DataLoader, DataLoader
     train_ds = SegDataset(data_root=cfg.data_dir,
                           split="train",
                           resolution=cfg.image_size,
-                          transform=augmentation)
-           
+                          transform=augmentation,
+                          n_validation=cfg.n_validation,
+                          seed=cfg.split_seed,
+                          fold=cfg.fold,
+                          n_folds=cfg.n_folds)
+
     val_ds = SegDataset(data_root=cfg.data_dir,
                         split="validation",
-                        resolution=cfg.image_size)
+                        resolution=cfg.image_size,
+                        n_validation=cfg.n_validation,
+                        seed=cfg.split_seed,
+                        fold=cfg.fold,
+                        n_folds=cfg.n_folds)
 
     def _seed_worker(worker_id: int) -> None:
         worker_seed = torch.utils.data.get_worker_info().seed % (2**32)
