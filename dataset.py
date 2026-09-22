@@ -1,13 +1,11 @@
 """
 PyTorch Dataset for brain MRI FLAIR abnormality segmentation.
-
-Reads per-patient TIF slices from disk, applies preprocessing
-(crop, pad, resize, normalize), and serves (image, mask) tensor pairs.
+Reads per-patient TIF slices from disk, applies preprocessing (crop, pad, resize, normalize), and serves (image, mask) tensor pairs.
 """
 
 import os
 import random
-from typing import Optional, Tuple, List, Callable
+from typing import Optional, Tuple, List, Callable, Dict
 
 import numpy as np
 import numpy.typing as npt
@@ -18,6 +16,52 @@ from skimage.io import imread
 from torch.utils.data import Dataset
 
 from utils import crop_to_content, pad_to_square, resize_volume, normalize_intensity
+
+
+class PatientSplitter:
+    """
+    Deterministic patient-level K-fold split.
+
+    All patient IDs are shuffled once with `seed` and dealt into `n_folds` folds.
+    Fold `fold` is the test set. From the remaining patients, `n_validation` are
+    drawn (with a fold-specific seed) as the validation set used for checkpoint
+    selection; the rest are training patients. The same `seed` gives the same
+    folds for every architecture and every training seed.
+    """
+
+    @staticmethod
+    def kfold(patient_ids: List[str],
+              n_folds: int,
+              fold: int,
+              n_validation: int,
+              seed: int) -> Dict[str, List[str]]:
+        """
+        :param patient_ids: All patient identifiers
+        :param n_folds: Number of folds (K)
+        :param fold: Index of the test fold, 0 <= fold < n_folds
+        :param n_validation: Number of validation patients taken from the non-test patients
+        :param seed: Split seed (keep fixed across all runs you want to compare)
+        :return: Dict with keys 'train', 'validation', 'test' mapping to sorted patient ID lists
+        """
+        if not 0 <= fold < n_folds:
+            raise ValueError(f"fold must be in [0, {n_folds - 1}], got {fold}")
+
+        ids = sorted(patient_ids)
+        random.Random(seed).shuffle(ids)
+
+        folds = [ids[i::n_folds] for i in range(n_folds)]
+        test_ids = set(folds[fold])
+        remaining = [pid for pid in ids if pid not in test_ids]
+
+        if n_validation >= len(remaining):
+            raise ValueError(f"n_validation={n_validation} leaves no training patients")
+
+        val_ids = set(random.Random(seed + 1 + fold).sample(remaining, k=n_validation))
+        train_ids = [pid for pid in remaining if pid not in val_ids]
+
+        return {"train": sorted(train_ids),
+                "validation": sorted(val_ids),
+                "test": sorted(test_ids)}
 
 
 class MRISegmentationDataset(Dataset):
