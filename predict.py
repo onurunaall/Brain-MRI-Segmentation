@@ -34,9 +34,6 @@ def run_inference(cfg: argparse.Namespace) -> None:
 
     val_loader = _build_loader(cfg)
 
-    model = UNetModel(in_channels=SegDataset.num_input_channels,
-                      out_channels=SegDataset.num_output_channels)
-    
     model = ModelFactory.create(cfg.arch,
                                 in_channels=SegDataset.num_input_channels,
                                 out_channels=SegDataset.num_output_channels)
