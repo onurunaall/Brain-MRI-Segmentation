@@ -1,10 +1,4 @@
-"""
-U-Net architecture for biomedical image segmentation.
-
-Encoder–decoder network with skip connections and batch normalization,
-designed for pixel-wise binary segmentation of MRI volumes.
-"""
-
+""" U-Net architecture for biomedical image segmentation """
 from collections import OrderedDict
 
 import torch
@@ -116,3 +110,67 @@ class UNetModel(nn.Module):
                  (f"{tag}_act2", nn.ReLU(inplace=True))]
             )
         )
+
+
+class _ResidualBlock(nn.Module):
+    """(Conv3x3 -> BN -> ReLU -> Conv3x3 -> BN) + shortcut -> ReLU."""
+
+    def __init__(self, ch_in: int, ch_out: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(ch_in, ch_out, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(ch_out)
+        self.conv2 = nn.Conv2d(ch_out, ch_out, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(ch_out)
+        self.act = nn.ReLU(inplace=True)
+
+        if ch_in == ch_out:
+            self.shortcut = nn.Identity()
+        else:
+            self.shortcut = nn.Sequential(nn.Conv2d(ch_in, ch_out, kernel_size=1, bias=False),
+                                          nn.BatchNorm2d(ch_out))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.shortcut(x)
+        out = self.act(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.act(out + identity)
+
+
+class ResUNetModel(nn.Module):
+    """U-Net with residual blocks. Pooling, upsampling and widths match UNetModel."""
+
+    def __init__(self, in_channels: int = 3, out_channels: int = 1, base_filters: int = 32) -> None:
+        super().__init__()
+        f = base_filters
+
+        self.enc_block1 = _ResidualBlock(in_channels, f)
+        self.enc_block2 = _ResidualBlock(f, f * 2)
+        self.enc_block3 = _ResidualBlock(f * 2, f * 4)
+        self.enc_block4 = _ResidualBlock(f * 4, f * 8)
+        self.bridge = _ResidualBlock(f * 8, f * 16)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.upsample4 = nn.ConvTranspose2d(f * 16, f * 8, kernel_size=2, stride=2)
+        self.dec_block4 = _ResidualBlock(f * 8 * 2, f * 8)
+        self.upsample3 = nn.ConvTranspose2d(f * 8, f * 4, kernel_size=2, stride=2)
+        self.dec_block3 = _ResidualBlock(f * 4 * 2, f * 4)
+        self.upsample2 = nn.ConvTranspose2d(f * 4, f * 2, kernel_size=2, stride=2)
+        self.dec_block2 = _ResidualBlock(f * 2 * 2, f * 2)
+        self.upsample1 = nn.ConvTranspose2d(f * 2, f, kernel_size=2, stride=2)
+        self.dec_block1 = _ResidualBlock(f * 2, f)
+
+        self.head = nn.Conv2d(f, out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc_block1(x)
+        e2 = self.enc_block2(self.pool(e1))
+        e3 = self.enc_block3(self.pool(e2))
+        e4 = self.enc_block4(self.pool(e3))
+        latent = self.bridge(self.pool(e4))
+
+        d4 = self.dec_block4(torch.cat((self.upsample4(latent), e4), dim=1))
+        d3 = self.dec_block3(torch.cat((self.upsample3(d4), e3), dim=1))
+        d2 = self.dec_block2(torch.cat((self.upsample2(d3), e2), dim=1))
+        d1 = self.dec_block1(torch.cat((self.upsample1(d2), e1), dim=1))
+
+        return torch.sigmoid(self.head(d1))
