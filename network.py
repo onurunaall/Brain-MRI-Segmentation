@@ -271,3 +271,32 @@ class _SwinBlock(nn.Module):
 
         x = shortcut + x
         return x + self.mlp(self.norm2(x))
+
+
+class _PatchMerging(nn.Module):
+    """(B, H, W, C) -> (B, H/2, W/2, 2C)"""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(4 * dim)
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.cat((x[:, 0::2, 0::2], x[:, 1::2, 0::2], x[:, 0::2, 1::2], x[:, 1::2, 1::2]), dim=-1)
+        return self.reduction(self.norm(x))
+
+
+class _SwinStage(nn.Module):
+    """`depth` Swin blocks alternating regular / shifted windows, then patch merging."""
+
+    def __init__(self, dim: int, depth: int, num_heads: int, ws: int) -> None:
+        super().__init__()
+        blocks = []
+        for d in range(depth):
+            shift = 0 if d % 2 == 0 else ws // 2
+            blocks.append(_SwinBlock(dim, num_heads, ws, shift))
+        self.blocks = nn.Sequential(*blocks)
+        self.merge = _PatchMerging(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.merge(self.blocks(x))
