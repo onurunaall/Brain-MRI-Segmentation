@@ -83,7 +83,9 @@ class MRISegmentationDataset(Dataset):
                  resolution: int = 256,
                  split: str = "train",
                  n_validation: int = 10,
-                 seed: int = 42) -> None:
+                 seed: int = 42,
+                 fold: Optional[int] = None,
+                 n_folds: int = 5) -> None:
         """
         :param data_root: Root directory containing per-patient subdirectories with .tif slices
         :param transform: Optional augmentation callable operating on (image, mask) tuples
@@ -91,8 +93,12 @@ class MRISegmentationDataset(Dataset):
         :param split: One of 'all', 'train', 'validation'
         :param n_validation: Number of patients held out for validation
         :param seed: Random seed for reproducible train/val splitting
+        :param fold: If given, use K-fold splitting (PatientSplitter) and treat this fold as test
+        :param n_folds: Number of folds when fold is given
         """
-        assert split in ("all", "train", "validation"), f"Unknown split: {split}"
+        assert split in ("all", "train", "validation", "test"), f"Unknown split: {split}"
+        if split == "test" and fold is None:
+            raise ValueError("split='test' requires fold to be set")
 
         patient_dirs: dict[str, str] = {}
         
@@ -108,6 +114,9 @@ class MRISegmentationDataset(Dataset):
 
         if split == "all":
             self.patient_ids = all_patient_ids
+        elif fold is not None:
+            splits = PatientSplitter.kfold(all_patient_ids, n_folds, fold, n_validation, seed)
+            self.patient_ids = splits[split]
         else:
             random.seed(seed)
             val_ids = random.sample(all_patient_ids, k=n_validation)
