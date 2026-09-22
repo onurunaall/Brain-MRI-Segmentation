@@ -5,6 +5,7 @@ Usage: python predict.py --model-path ./checkpoints/best_model.pt --data-dir ./k
 
 import argparse
 import os
+import json
 from io import BytesIO
 from typing import Dict, Tuple, List
 
@@ -17,7 +18,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import MRISegmentationDataset as SegDataset
-from network import UNetModel
+from network import ModelFactory
+from evaluation import PatientEvaluator
 from utils import dice_similarity_coefficient, grayscale_to_rgb, draw_contour
 
 
@@ -35,8 +37,12 @@ def run_inference(cfg: argparse.Namespace) -> None:
     model = UNetModel(in_channels=SegDataset.num_input_channels,
                       out_channels=SegDataset.num_output_channels)
     
+    model = ModelFactory.create(cfg.arch,
+                                in_channels=SegDataset.num_input_channels,
+                                out_channels=SegDataset.num_output_channels)
+
     state = torch.load(cfg.model_path, map_location=device, weights_only=True)
-    model.load_state_dict(state)
+    model.load_state_dict(PatientEvaluator.strip_compile_prefix(state))
     model.eval()
     model.to(device)
 
@@ -69,6 +75,25 @@ def run_inference(cfg: argparse.Namespace) -> None:
     dice_scores = _compute_dice_per_patient(patient_volumes)
     chart_image = _plot_dice_distribution(dice_scores)
     imsave(cfg.figure_path, chart_image)
+    
+    if cfg.results_json:
+        dice_raw = PatientEvaluator.raw_dice_per_patient(all_preds,
+                                                         all_targets,
+                                                         val_loader.dataset.flat_index,
+                                                         val_loader.dataset.patient_ids)
+        hd95_scores = PatientEvaluator.hd95_per_patient(patient_volumes)
+        meta = {"arch": cfg.arch,
+                "split": cfg.split,
+                "fold": cfg.fold,
+                "n_folds": cfg.n_folds,
+                "split_seed": cfg.split_seed,
+                "seed": cfg.seed,
+                "model_path": cfg.model_path}
+        PatientEvaluator.write_results(cfg.results_json, meta, dice_scores, dice_raw, hd95_scores)
+        print(f"[Predict] mean Dice (LCC) = {np.mean(list(dice_scores.values())):.4f} -> {cfg.results_json}")
+
+    if cfg.skip_overlays:
+        return
 
     for pid, (vol_in, vol_pred, vol_true) in patient_volumes.items():
         for s in range(vol_in.shape[0]):
@@ -89,8 +114,12 @@ def _build_loader(cfg: argparse.Namespace) -> DataLoader:
     :return: DataLoader for validation split
     """
     ds = SegDataset(data_root=cfg.data_dir,
-                    split="validation",
-                    resolution=cfg.image_size)
+                    split=cfg.split,
+                    resolution=cfg.image_size,
+                    n_validation=cfg.n_validation,
+                    seed=cfg.split_seed,
+                    fold=cfg.fold,
+                    n_folds=cfg.n_folds)
     
     return DataLoader(ds, batch_size=cfg.batch_size, drop_last=False, num_workers=1)
 
@@ -191,6 +220,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=256, help="Target spatial resolution (default: 256)")
     parser.add_argument("--output-dir", type=str, default="./predictions", help="Directory for overlay images")
     parser.add_argument("--figure-path", type=str, default="./dice_distribution.png", help="Path for Dice chart")
+    parser.add_argument("--arch", type=str, default="unet", choices=ModelFactory.available(), help="Model architecture (must match the checkpoint)")
+    parser.add_argument("--split", type=str, default="validation", choices=["validation", "test"], help="Which patients to evaluate (default: validation)")
+    parser.add_argument("--fold", type=int, default=None, help="Test fold index; required for --split test")
+    parser.add_argument("--n-folds", type=int, default=5, help="Number of CV folds (default: 5)")
+    parser.add_argument("--n-validation", type=int, default=10, help="Must match the value used in training (default: 10)")
+    parser.add_argument("--split-seed", type=int, default=42, help="Must match the value used in training (default: 42)")
+    parser.add_argument("--seed", type=int, default=0, help="Training seed of this checkpoint; only recorded in the results JSON")
+    parser.add_argument("--results-json", type=str, default=None, help="If set, write per-patient metrics to this JSON file")
+    parser.add_argument("--skip-overlays", action="store_true", help="Do not write per-slice overlay PNGs")
     
     return parser.parse_args()
 
