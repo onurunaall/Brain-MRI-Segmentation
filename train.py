@@ -234,8 +234,9 @@ def run_training(cfg: argparse.Namespace) -> None:
                 # Checkpoint if improved
                 if mean_dice > best_val_dice:
                     best_val_dice = mean_dice
+                    best_epoch = epoch
                     ckpt_path = os.path.join(cfg.checkpoint_dir, "best_model.pt")
-                    torch.save(model.state_dict(), ckpt_path)
+                    torch.save(base_model.state_dict(), ckpt_path)
 
                 running_val_loss = []
         
@@ -243,7 +244,26 @@ def run_training(cfg: argparse.Namespace) -> None:
         logger.log_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
 
     logger.close()
-    print(f"Training complete. Best validation DSC: {best_val_dice:.4f}")
+
+    elapsed = time.perf_counter() - train_start
+    peak_mem_mb = torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else None
+    summary = {"arch": cfg.arch,
+               "fold": cfg.fold,
+               "seed": cfg.seed,
+               "epochs": cfg.epochs,
+               "best_val_dice": best_val_dice,
+               "best_epoch": best_epoch,
+               "train_seconds_total": elapsed,
+               "seconds_per_epoch": elapsed / cfg.epochs,
+               "peak_train_memory_mb": peak_mem_mb,
+               "n_params": sum(p.numel() for p in base_model.parameters()),
+               "train_patients": train_loader.dataset.patient_ids,
+               "val_patients": val_loader.dataset.patient_ids}
+
+    with open(os.path.join(cfg.log_dir, "train_summary.json"), "w") as fp:
+        json.dump(summary, fp, indent=2)
+
+    print(f"Training complete. Best validation DSC: {best_val_dice:.4f} (epoch {best_epoch})")
 
     
 def _parse_args() -> argparse.Namespace:
@@ -263,7 +283,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--aug-scale", type=float, default=0.05, help="Scale augmentation range (default: 0.05)")
     parser.add_argument("--aug-angle", type=float, default=15.0, help="Rotation augmentation range in degrees (default: 15)")
     parser.add_argument("--arch", type=str, default="unet", choices=ModelFactory.available(), help="Model architecture (default: unet)")
-    
+    parser.add_argument("--seed", type=int, default=0, help="Training seed: weight init, sampling, augmentation (default: 0)")
+    parser.add_argument("--fold", type=int, default=None, help="Test fold index for K-fold CV (default: None = old 100/10 split)")
+    parser.add_argument("--n-folds", type=int, default=5, help="Number of CV folds (default: 5)")
+    parser.add_argument("--n-validation", type=int, default=10, help="Validation patients for checkpoint selection (default: 10)")
+    parser.add_argument("--split-seed", type=int, default=42, help="Patient split seed; keep fixed across runs (default: 42)")
     return parser.parse_args()
 
 
