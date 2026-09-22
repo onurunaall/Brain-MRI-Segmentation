@@ -1,0 +1,20 @@
+[project]
+name = "brain-mri-segmentation"
+version = "0.1.0"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "numpy<2.0",
+    "scikit-image>=0.22.0",
+    "medpy>=0.4.0",
+    "Pillow>=10.0.0",
+    "scipy",
+    "tensorboard>=2.15.0",
+    "matplotlib>=3.8.0",
+    "tqdm>=4.66.0",
+    "kagglehub",
+]
+
+[tool.uv]
+package = false
