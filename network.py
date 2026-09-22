@@ -300,3 +300,39 @@ class _SwinStage(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.merge(self.blocks(x))
+
+
+class _ConvResBlock(nn.Module):
+    """(Conv3x3 -> IN -> LReLU -> Conv3x3 -> IN) + shortcut -> LReLU (MONAI UnetResBlock style)."""
+
+    def __init__(self, ch_in: int, ch_out: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(ch_in, ch_out, kernel_size=3, padding=1, bias=False)
+        self.norm1 = nn.InstanceNorm2d(ch_out)
+        self.conv2 = nn.Conv2d(ch_out, ch_out, kernel_size=3, padding=1, bias=False)
+        self.norm2 = nn.InstanceNorm2d(ch_out)
+        self.act = nn.LeakyReLU(0.01, inplace=True)
+
+        if ch_in == ch_out:
+            self.shortcut = nn.Identity()
+        else:
+            self.shortcut = nn.Sequential(nn.Conv2d(ch_in, ch_out, kernel_size=1, bias=False),
+                                          nn.InstanceNorm2d(ch_out))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.shortcut(x)
+        out = self.act(self.norm1(self.conv1(x)))
+        out = self.norm2(self.conv2(out))
+        return self.act(out + identity)
+
+
+class _UpBlock(nn.Module):
+    """ConvTranspose2x2 -> concat skip -> residual conv block."""
+
+    def __init__(self, ch_in: int, ch_out: int) -> None:
+        super().__init__()
+        self.up = nn.ConvTranspose2d(ch_in, ch_out, kernel_size=2, stride=2)
+        self.block = _ConvResBlock(ch_out * 2, ch_out)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        return self.block(torch.cat((self.up(x), skip), dim=1))
