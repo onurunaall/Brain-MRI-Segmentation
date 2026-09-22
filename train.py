@@ -1,8 +1,3 @@
-"""
-Training script for MRI FLAIR abnormality segmentation using U-Net.
-Usage: python train.py --data-dir ./kaggle_3m --epochs 100 --lr 1e-4
-"""
-
 import argparse
 import json
 import os
@@ -18,7 +13,7 @@ from dataset import MRISegmentationDataset as SegDataset
 from tb_logger import TensorBoardLogger
 from losses import SoftDiceLoss
 from augmentations import build_augmentation_pipeline
-from network import UNetModel
+from network import ModelFactory
 from utils import compose_visualization, dice_similarity_coefficient
 
 
