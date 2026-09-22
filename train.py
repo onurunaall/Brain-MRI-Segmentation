@@ -163,8 +163,13 @@ def run_training(cfg: argparse.Namespace) -> None:
     running_val_loss: List[float] = []
 
     global_step = 0
+    best_epoch = -1
 
-    for epoch in tqdm(range(cfg.epochs), desc="Epochs"):
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    train_start = time.perf_counter()
+
+    for epoch in tqdm
         for phase in ("train", "valid"):
             if phase == "train":
                 model.train()
