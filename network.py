@@ -3,6 +3,7 @@ from collections import OrderedDict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class UNetModel(nn.Module):
@@ -174,3 +175,39 @@ class ResUNetModel(nn.Module):
         d1 = self.dec_block1(torch.cat((self.upsample1(d2), e1), dim=1))
 
         return torch.sigmoid(self.head(d1))
+
+
+class _WindowAttention(nn.Module):
+    """Multi-head self-attention inside a window, with learned relative position bias."""
+
+    def __init__(self, dim: int, num_heads: int, ws: int) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = (dim // num_heads) ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.proj = nn.Linear(dim, dim)
+
+        self.rel_bias_table = nn.Parameter(torch.zeros((2 * ws - 1) ** 2, num_heads))
+        nn.init.trunc_normal_(self.rel_bias_table, std=0.02)
+
+        coords = torch.stack(torch.meshgrid(torch.arange(ws), torch.arange(ws), indexing="ij")).flatten(1)
+        rel = (coords[:, :, None] - coords[:, None, :]).permute(1, 2, 0) + (ws - 1)
+        self.register_buffer("rel_index", rel[..., 0] * (2 * ws - 1) + rel[..., 1], persistent=False)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        bw, n, c = x.shape
+        qkv = self.qkv(x).reshape(bw, n, 3, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q * self.scale) @ k.transpose(-2, -1)
+        bias = self.rel_bias_table[self.rel_index.reshape(-1)].reshape(n, n, -1).permute(2, 0, 1)
+        attn = attn + bias.unsqueeze(0)
+
+        if mask is not None:
+            n_win = mask.shape[0]
+            attn = attn.view(bw // n_win, n_win, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(bw, self.num_heads, n, n)
+
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(bw, n, c)
+        return self.proj(out)
