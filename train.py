@@ -167,9 +167,10 @@ def run_training(cfg: argparse.Namespace) -> None:
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+    
     train_start = time.perf_counter()
 
-    for epoch in tqdm
+    for epoch in range(cfg.epochs):
         for phase in ("train", "valid"):
             if phase == "train":
                 model.train()
