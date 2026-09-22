@@ -336,3 +336,66 @@ class _UpBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         return self.block(torch.cat((self.up(x), skip), dim=1))
+
+
+class SwinUNETRModel(nn.Module):
+    """
+    2D Swin-UNETR. Input H and W must be divisible by 16 * window_size (128 for window 8).
+    """
+
+    def __init__(self, in_channels: int = 3, out_channels: int = 1, feature_size: int = 24,
+                 depths: tuple = (2, 2, 2, 2), num_heads: tuple = (3, 6, 12, 24),
+                 window_size: int = 8) -> None:
+        super().__init__()
+        fs = feature_size
+        self.window_size = window_size
+
+        self.patch_embed = nn.Conv2d(in_channels, fs, kernel_size=2, stride=2)
+        self.stages = nn.ModuleList(
+            [_SwinStage(fs * 2 ** i, depths[i], num_heads[i], window_size) for i in range(4)]
+        )
+
+        self.encoder1 = _ConvResBlock(in_channels, fs)
+        self.encoder2 = _ConvResBlock(fs, fs)
+        self.encoder3 = _ConvResBlock(fs * 2, fs * 2)
+        self.encoder4 = _ConvResBlock(fs * 4, fs * 4)
+        self.encoder10 = _ConvResBlock(fs * 16, fs * 16)
+
+        self.decoder5 = _UpBlock(fs * 16, fs * 8)
+        self.decoder4 = _UpBlock(fs * 8, fs * 4)
+        self.decoder3 = _UpBlock(fs * 4, fs * 2)
+        self.decoder2 = _UpBlock(fs * 2, fs)
+        self.decoder1 = _UpBlock(fs, fs)
+
+        self.head = nn.Conv2d(fs, out_channels, kernel_size=1)
+
+    @staticmethod
+    def _to_channels_first(x: torch.Tensor) -> torch.Tensor:
+        """(B, H, W, C) -> non-affine LayerNorm over C -> (B, C, H, W)"""
+        x = F.layer_norm(x, x.shape[-1:])
+        return x.permute(0, 3, 1, 2).contiguous()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h, w = x.shape[-2:]
+        divisor = 16 * self.window_size
+        assert h % divisor == 0 and w % divisor == 0, f"H and W must be divisible by {divisor}, got {h}x{w}"
+
+        tokens = self.patch_embed(x).permute(0, 2, 3, 1)
+        hidden = [self._to_channels_first(tokens)]
+        for stage in self.stages:
+            tokens = stage(tokens)
+            hidden.append(self._to_channels_first(tokens))
+
+        enc0 = self.encoder1(x)
+        enc1 = self.encoder2(hidden[0])
+        enc2 = self.encoder3(hidden[1])
+        enc3 = self.encoder4(hidden[2])
+        dec4 = self.encoder10(hidden[4])
+
+        dec3 = self.decoder5(dec4, hidden[3])
+        dec2 = self.decoder4(dec3, enc3)
+        dec1 = self.decoder3(dec2, enc2)
+        dec0 = self.decoder2(dec1, enc1)
+        out = self.decoder1(dec0, enc0)
+
+        return torch.sigmoid(self.head(out))
