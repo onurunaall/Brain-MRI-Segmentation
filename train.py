@@ -130,8 +130,12 @@ def run_training(cfg: argparse.Namespace) -> None:
     train_loader, val_loader = _create_dataloaders(cfg)
     phase_loaders = {"train": train_loader, "valid": val_loader}
 
-    model = UNetModel(in_channels=SegDataset.num_input_channels,
-                      out_channels=SegDataset.num_output_channels)
+    model = ModelFactory.create(
+        cfg.arch,
+        in_channels=SegDataset.num_input_channels,
+        out_channels=SegDataset.num_output_channels
+    )
+    
     model.to(device)
 
     if hasattr(torch, "compile"):
