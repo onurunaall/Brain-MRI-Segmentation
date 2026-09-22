@@ -1,10 +1,9 @@
 """
 Utility functions for MRI segmentation preprocessing and evaluation.
-
-Provides helper routines for volume cropping, padding, resizing,
-normalization, Dice score computation, and visualization overlays.
+Provides helper routines for volume cropping, padding, resizing, normalization, Dice score computation, and visualization overlays.
 """
 
+import random
 from typing import Tuple, List, Optional
 
 import numpy as np
@@ -267,3 +266,17 @@ def draw_contour(image: npt.NDArray[np.uint8],
             image[max(0, r): r + 1, max(0, c): c + 1] = color
 
     return image
+
+
+class Reproducibility:
+    """Seeds every random number generator used during training."""
+
+    @staticmethod
+    def seed_everything(seed: int) -> None:
+        """
+        :param seed: Seed for Python, NumPy and PyTorch (CPU and all CUDA devices)
+        """
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
