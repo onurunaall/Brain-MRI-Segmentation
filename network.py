@@ -399,3 +399,28 @@ class SwinUNETRModel(nn.Module):
         out = self.decoder1(dec0, enc0)
 
         return torch.sigmoid(self.head(out))
+
+
+class ModelFactory:
+    """
+    Simple Factory: maps an architecture name to its model class.
+    To add a model, add one entry to _registry. Callers never import model classes directly.
+    """
+
+    _registry = {
+        "unet": UNetModel,
+        "resunet": ResUNetModel,
+        "swinunetr": SwinUNETRModel,
+    }
+
+    @classmethod
+    def available(cls) -> list:
+        """Sorted list of registered architecture names (use for argparse choices)."""
+        return sorted(cls._registry)
+
+    @classmethod
+    def create(cls, arch: str, in_channels: int, out_channels: int) -> nn.Module:
+        """Instantiate the named architecture with its default width settings."""
+        if arch not in cls._registry:
+            raise ValueError(f"Unknown arch '{arch}'. Choose from {cls.available()}")
+        return cls._registry[arch](in_channels=in_channels, out_channels=out_channels)
