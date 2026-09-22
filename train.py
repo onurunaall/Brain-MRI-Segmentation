@@ -246,6 +246,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=256, help="Target spatial resolution (default: 256)")
     parser.add_argument("--aug-scale", type=float, default=0.05, help="Scale augmentation range (default: 0.05)")
     parser.add_argument("--aug-angle", type=float, default=15.0, help="Rotation augmentation range in degrees (default: 15)")
+    parser.add_argument("--arch", type=str, default="unet", choices=ModelFactory.available(), help="Model architecture (default: unet)")
     
     return parser.parse_args()
 
