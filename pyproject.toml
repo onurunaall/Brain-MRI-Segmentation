@@ -1,11 +1,11 @@
+cat << 'EOF' > pyproject.toml
 [project]
 name = "brain-mri-segmentation"
 version = "0.1.0"
-requires-python = ">=3.10,<3.13"
+description = "Brain MRI Segmentation with U-Net, ResUNet, and SwinUNETR"
+readme = "README.md"
+requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.1.0",
-    "torchvision>=0.16.0",
-    "numpy<2.0",
     "scikit-image>=0.22.0",
     "medpy>=0.4.0",
     "Pillow>=10.0.0",
@@ -18,3 +18,5 @@ dependencies = [
 
 [tool.uv]
 package = false
+system-site-packages = true
+EOF
