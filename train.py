@@ -171,6 +171,9 @@ def run_training(cfg: argparse.Namespace) -> None:
     train_start = time.perf_counter()
 
     for epoch in range(cfg.epochs):
+        # Progress bar across epochs
+        print(f"\n--- Epoch {epoch + 1}/{cfg.epochs} ---")
+        
         for phase in ("train", "valid"):
             if phase == "train":
                 model.train()
@@ -180,7 +183,15 @@ def run_training(cfg: argparse.Namespace) -> None:
             val_predictions: List[np.ndarray] = []
             val_targets: List[np.ndarray] = []
 
-            for batch_idx, (inputs, targets) in enumerate(phase_loaders[phase]):
+            # Wrap the phase DataLoader with tqdm
+            pbar = tqdm(
+                phase_loaders[phase],
+                desc=f"{phase.capitalize():>5}",
+                leave=False,
+                dynamic_ncols=True
+            )
+
+            for batch_idx, (inputs, targets) in enumerate(pbar):
                 if phase == "train":
                     global_step += 1
 
@@ -218,6 +229,10 @@ def run_training(cfg: argparse.Namespace) -> None:
                         scaler.step(optimizer)
                         scaler.update()
 
+                # Update live progress bar display
+                current_loss = batch_loss.item()
+                pbar.set_postfix({"loss": f"{current_loss:.4f}"})
+
                 if phase == "train" and (global_step + 1) % 10 == 0:
                     _log_mean_loss(logger, running_train_loss, global_step, prefix="train/")
                     running_train_loss = []
@@ -233,11 +248,17 @@ def run_training(cfg: argparse.Namespace) -> None:
                 logger.log_scalar("val/dice", mean_dice, global_step)
 
                 # Checkpoint if improved
+                is_best = ""
                 if mean_dice > best_val_dice:
                     best_val_dice = mean_dice
                     best_epoch = epoch
                     ckpt_path = os.path.join(cfg.checkpoint_dir, "best_model.pt")
                     torch.save(base_model.state_dict(), ckpt_path)
+                    is_best = " (NEW BEST)"
+
+                # Print epoch summary line
+                val_loss_avg = float(np.mean(running_val_loss)) if running_val_loss else 0.0
+                print(f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} | Val Loss: {val_loss_avg:.4f} | Val Dice: {mean_dice:.4f}{is_best}")
 
                 running_val_loss = []
         
