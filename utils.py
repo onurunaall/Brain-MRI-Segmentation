@@ -29,10 +29,13 @@ def dice_similarity_coefficient(prediction: npt.NDArray[np.float32],
     :return: Dice coefficient in range [0.0, 1.0]
     """
     # Optionally binarize and keep only the largest connected component
-    if apply_lcc and np.any(prediction):
+    if apply_lcc:
         prediction = np.round(prediction).astype(np.int32)
         ground_truth = np.round(ground_truth).astype(np.int32)
-        prediction = largest_connected_component(prediction)
+        # Check emptiness *after* binarization: sigmoid outputs are never exactly 0,
+        # so an all-sub-threshold volume would otherwise reach LCC with no components
+        if np.any(prediction):
+            prediction = largest_connected_component(prediction)
 
     overlap = np.sum(prediction[ground_truth == 1])
     total = np.sum(prediction) + np.sum(ground_truth)
