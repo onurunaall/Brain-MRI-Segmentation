@@ -32,8 +32,6 @@ def dice_similarity_coefficient(prediction: npt.NDArray[np.float32],
     if apply_lcc:
         prediction = np.round(prediction).astype(np.int32)
         ground_truth = np.round(ground_truth).astype(np.int32)
-        # Check emptiness *after* binarization: sigmoid outputs are never exactly 0,
-        # so an all-sub-threshold volume would otherwise reach LCC with no components
         if np.any(prediction):
             prediction = largest_connected_component(prediction)
 
