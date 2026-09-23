@@ -187,7 +187,11 @@ class MRISegmentationDataset(Dataset):
 
         self.volumes = [(vol, seg[..., np.newaxis]) for vol, seg in paired]
 
-        print(f"[Dataset] {split} dataset ready — {len(self.patient_ids)} patients")
+        n_slices_total = sum(vol.shape[0] for vol, _ in self.volumes)
+        n_tumor_slices = sum(int(np.count_nonzero(seg.reshape(seg.shape[0], -1).any(axis=1)))
+                             for _, seg in self.volumes)
+        print(f"[Dataset] {split} dataset ready — {len(self.patient_ids)} patients, "
+              f"{n_slices_total} slices ({n_tumor_slices} contain tumour)")
 
         # ── Stage 6: Build flat index → (patient_idx, slice_idx) mapping ──
         slices_per_patient = [vol.shape[0] for vol, _ in self.volumes]
