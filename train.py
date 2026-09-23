@@ -125,6 +125,49 @@ def _save_config(cfg: argparse.Namespace) -> None:
         json.dump(vars(cfg), fp, indent=2)
 
 
+def _print_run_header(cfg: argparse.Namespace,
+                      device: torch.device,
+                      n_params: int,
+                      train_loader: DataLoader,
+                      val_loader: DataLoader) -> None:
+    """Print a one-time summary of what this run trains on and how."""
+    if cfg.fold is None:
+        split_desc = f"single split (no test fold), split seed {cfg.split_seed}"
+    else:
+        split_desc = (f"fold {cfg.fold} of {cfg.n_folds} (folds numbered 0-{cfg.n_folds - 1}) "
+                      f"held out as test set, split seed {cfg.split_seed}")
+
+    print("\n================ Run configuration ================")
+    print(f"  Model        : {cfg.arch} ({n_params / 1e6:.2f} M parameters)")
+    print(f"  Data split   : {split_desc}")
+    print(f"  Train seed   : {cfg.seed}")
+    print(f"  Device       : {device}")
+    print(f"  Train set    : {len(train_loader.dataset.patient_ids)} patients, "
+          f"{len(train_loader.dataset)} slices, {len(train_loader)} batches/epoch")
+    print(f"  Val set      : {len(val_loader.dataset.patient_ids)} patients, "
+          f"{len(val_loader.dataset)} slices, {len(val_loader)} batches/epoch")
+    print(f"  Schedule     : {cfg.epochs} epochs, batch size {cfg.batch_size}, "
+          f"Adam lr {cfg.lr:g} with cosine decay")
+    print(f"  Checkpoints  : {cfg.checkpoint_dir}")
+    print(f"  TensorBoard  : {cfg.log_dir}")
+    print("===================================================")
+
+
+def _print_metric_legend() -> None:
+    """Explain the columns of the per-epoch summary line."""
+    print("\nPer-epoch line columns:")
+    print("  train loss : mean soft-Dice loss (1 - Dice) over this epoch's training batches;")
+    print("               computed with augmentation on, so not directly comparable to val loss. Lower = better.")
+    print("  val loss   : same loss on the validation slices (no augmentation). Lower = better.")
+    print("  val Dice   : per-patient 3D Dice on the validation set after thresholding at 0.5")
+    print("               and keeping the largest connected component, averaged over patients.")
+    print("               0 = no overlap, 1 = perfect. Higher = better. Used to pick the checkpoint.")
+    print("  best       : highest val Dice so far and the epoch it was reached.")
+    print("  NEW BEST   : val Dice improved -> model saved to best_model.pt (the model that gets tested).")
+    print("  lr         : learning rate used during this epoch.")
+    print("  time       : wall-clock seconds for this epoch (train + validation).\n")
+
+
 def run_training(cfg: argparse.Namespace) -> None:
     """
     Main training loop with validation and model checkpointing.
@@ -148,6 +191,10 @@ def run_training(cfg: argparse.Namespace) -> None:
     
     model.to(device)
     base_model = model  # uncompiled handle: its state_dict has no "_orig_mod." prefix
+    n_params = sum(p.numel() for p in base_model.parameters())
+
+    _print_run_header(cfg, device, n_params, train_loader, val_loader)
+    _print_metric_legend()
 
     if hasattr(torch, "compile"):
         model = torch.compile(model)
@@ -171,9 +218,10 @@ def run_training(cfg: argparse.Namespace) -> None:
     train_start = time.perf_counter()
 
     for epoch in range(cfg.epochs):
-        # Progress bar across epochs
-        print(f"\n--- Epoch {epoch + 1}/{cfg.epochs} ---")
-        
+        epoch_start = time.perf_counter()
+        epoch_lr = scheduler.get_last_lr()[0]  # LR in effect for this epoch (stepped at epoch end)
+        epoch_train_losses: List[float] = []   # full-epoch buffer; running_train_loss is reset every 10 steps
+
         for phase in ("train", "valid"):
             if phase == "train":
                 model.train()
@@ -186,7 +234,7 @@ def run_training(cfg: argparse.Namespace) -> None:
             # Wrap the phase DataLoader with tqdm
             pbar = tqdm(
                 phase_loaders[phase],
-                desc=f"{phase.capitalize():>5}",
+                desc=f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} {phase.capitalize():>5}",
                 leave=False,
                 dynamic_ncols=True
             )
@@ -225,6 +273,7 @@ def run_training(cfg: argparse.Namespace) -> None:
 
                     if phase == "train":
                         running_train_loss.append(batch_loss.item())
+                        epoch_train_losses.append(batch_loss.item())
                         scaler.scale(batch_loss).backward()
                         scaler.step(optimizer)
                         scaler.update()
@@ -258,7 +307,13 @@ def run_training(cfg: argparse.Namespace) -> None:
 
                 # Print epoch summary line
                 val_loss_avg = float(np.mean(running_val_loss)) if running_val_loss else 0.0
-                print(f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} | Val Loss: {val_loss_avg:.4f} | Val Dice: {mean_dice:.4f}{is_best}")
+                train_loss_avg = float(np.mean(epoch_train_losses)) if epoch_train_losses else float("nan")
+                best_desc = f"{best_val_dice:.4f} (ep {best_epoch + 1:03d})" if best_epoch >= 0 else "n/a"
+                epoch_secs = time.perf_counter() - epoch_start
+                print(f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} | "
+                      f"train loss {train_loss_avg:.4f} | val loss {val_loss_avg:.4f} | "
+                      f"val Dice {mean_dice:.4f} | best {best_desc} | "
+                      f"lr {epoch_lr:.2e} | time {epoch_secs:.1f}s{is_best}")
 
                 running_val_loss = []
         
@@ -278,14 +333,17 @@ def run_training(cfg: argparse.Namespace) -> None:
                "train_seconds_total": elapsed,
                "seconds_per_epoch": elapsed / cfg.epochs,
                "peak_train_memory_mb": peak_mem_mb,
-               "n_params": sum(p.numel() for p in base_model.parameters()),
+               "n_params": n_params,
                "train_patients": train_loader.dataset.patient_ids,
                "val_patients": val_loader.dataset.patient_ids}
 
     with open(os.path.join(cfg.log_dir, "train_summary.json"), "w") as fp:
         json.dump(summary, fp, indent=2)
 
-    print(f"Training complete. Best validation DSC: {best_val_dice:.4f} (epoch {best_epoch})")
+    # best_epoch is stored 0-based in train_summary.json; print it 1-based to match the epoch lines
+    best_epoch_desc = f"epoch {best_epoch + 1}/{cfg.epochs}" if best_epoch >= 0 else "never improved above 0"
+    print(f"Training complete in {elapsed / 60:.1f} min. "
+          f"Best validation Dice: {best_val_dice:.4f} ({best_epoch_desc}) -> {cfg.checkpoint_dir}/best_model.pt")
 
     
 def _parse_args() -> argparse.Namespace:
