@@ -89,6 +89,11 @@ def run_inference(cfg: argparse.Namespace) -> None:
         PatientEvaluator.write_results(cfg.results_json, meta, dice_scores, dice_raw, hd95_scores)
         print(f"[Predict] mean Dice (LCC) = {np.mean(list(dice_scores.values())):.4f} -> {cfg.results_json}")
 
+    if cfg.masks_npz:
+        _save_masks(cfg.masks_npz, patient_volumes)
+        print(f"[Predict] saved FLAIR, ground-truth and predicted masks for "
+              f"{len(patient_volumes)} patients -> {cfg.masks_npz}")
+
     if cfg.skip_overlays:
         return
 
@@ -154,6 +159,31 @@ def _reassemble_volumes(inputs: List[np.ndarray],
         offset += n_slices
 
     return volumes
+
+
+def _save_masks(path: str,
+                volumes: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]) -> None:
+    """
+    Store per-patient FLAIR, ground truth and LCC prediction so figures can be redrawn without the dataset.
+
+    Keys are '<patient_id>__flair' (uint8, per-patient min-max scaled), '<patient_id>__gt' and
+    '<patient_id>__pred' (uint8 0/1). All arrays have shape (Z, H, W) on the preprocessed grid.
+
+    :param path: Output .npz path
+    :param volumes: Dict patient_id -> (input, LCC prediction, target), as built by _reassemble_volumes
+    """
+    arrays: Dict[str, np.ndarray] = {}
+    for pid, (vol_in, vol_pred, vol_true) in volumes.items():
+        flair = vol_in[:, 1].astype(np.float32)  # channel 1 = FLAIR, as in the overlay PNGs
+        lo, hi = float(flair.min()), float(flair.max())
+        flair = (flair - lo) / (hi - lo) if hi > lo else np.zeros_like(flair)
+
+        arrays[f"{pid}__flair"] = np.round(flair * 255).astype(np.uint8)
+        arrays[f"{pid}__gt"] = (np.asarray(vol_true)[:, 0] > 0.5).astype(np.uint8)
+        arrays[f"{pid}__pred"] = (np.asarray(vol_pred)[:, 0] > 0.5).astype(np.uint8)
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    np.savez_compressed(path, **arrays)
 
 
 def _compute_dice_per_patient(volumes: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]) -> Dict[str, float]:
@@ -225,6 +255,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--split-seed", type=int, default=42, help="Must match the value used in training (default: 42)")
     parser.add_argument("--seed", type=int, default=0, help="Training seed of this checkpoint; only recorded in the results JSON")
     parser.add_argument("--results-json", type=str, default=None, help="If set, write per-patient metrics to this JSON file")
+    parser.add_argument("--masks-npz", type=str, default=None, help="If set, save FLAIR, ground-truth and predicted masks per patient to this .npz (used by compare.py)")
     parser.add_argument("--skip-overlays", action="store_true", help="Do not write per-slice overlay PNGs")
     
     return parser.parse_args()

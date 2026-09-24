@@ -14,22 +14,28 @@ for arch in $ARCHS; do
     for seed in $SEEDS; do
       run="$RUNS_DIR/$arch/fold${fold}_seed${seed}"
 
-      if [ -f "$run/test_results.json" ]; then
+      if [ -f "$run/test_results.json" ] && [ -f "$run/test_masks.npz" ]; then
         echo "[skip] $run already done"
         continue
       fi
 
-      echo "[train] $run"
-      python train.py --arch "$arch" --fold "$fold" --seed "$seed" --epochs "$EPOCHS" \
-        --data-dir "$DATA_DIR" --checkpoint-dir "$run/checkpoints" --log-dir "$run/logs"
+      if [ -f "$run/test_results.json" ] && [ -f "$run/checkpoints/best_model.pt" ]; then
+        # Finished before masks were saved: re-run inference only, no retraining
+        echo "[backfill] $run: saving test masks for comparison figures"
+      else
+        echo "[train] $run"
+        python train.py --arch "$arch" --fold "$fold" --seed "$seed" --epochs "$EPOCHS" \
+          --data-dir "$DATA_DIR" --checkpoint-dir "$run/checkpoints" --log-dir "$run/logs"
+      fi
 
       echo "[test] $run"
       python predict.py --arch "$arch" --fold "$fold" --seed "$seed" --split test \
         --data-dir "$DATA_DIR" --model-path "$run/checkpoints/best_model.pt" \
         --results-json "$run/test_results.json" --figure-path "$run/dice_distribution.png" \
-        --output-dir "$run/predictions" --skip-overlays
+        --masks-npz "$run/test_masks.npz" --output-dir "$run/predictions" --skip-overlays
     done
   done
 done
 
 python aggregate.py --runs-dir "$RUNS_DIR" --baseline unet --csv "$RUNS_DIR/summary.csv"
+python compare.py --runs-dir "$RUNS_DIR" --baseline unet --out-dir "$RUNS_DIR/figures"

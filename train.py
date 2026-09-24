@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import os
 import time
@@ -217,6 +218,11 @@ def run_training(cfg: argparse.Namespace) -> None:
     
     train_start = time.perf_counter()
 
+    # Per-epoch history for later comparison plots (compare.py); overwritten if the run is restarted
+    history_path = os.path.join(cfg.log_dir, "history.csv")
+    with open(history_path, "w", newline="") as fp:
+        csv.writer(fp).writerow(["epoch", "train_loss", "val_loss", "val_dice", "lr", "seconds", "new_best"])
+
     for epoch in range(cfg.epochs):
         epoch_start = time.perf_counter()
         epoch_lr = scheduler.get_last_lr()[0]  # LR in effect for this epoch (stepped at epoch end)
@@ -314,6 +320,10 @@ def run_training(cfg: argparse.Namespace) -> None:
                       f"train loss {train_loss_avg:.4f} | val loss {val_loss_avg:.4f} | "
                       f"val Dice {mean_dice:.4f} | best {best_desc} | "
                       f"lr {epoch_lr:.2e} | time {epoch_secs:.1f}s{is_best}")
+
+                with open(history_path, "a", newline="") as fp:
+                    csv.writer(fp).writerow([epoch + 1, train_loss_avg, val_loss_avg, mean_dice,
+                                             epoch_lr, epoch_secs, int(bool(is_best))])
 
                 running_val_loss = []
         
