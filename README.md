@@ -102,6 +102,39 @@ python predict.py \
   --figure-path ./assets/dice_distribution.png
 ```
 
+### 5. Compare architectures (K-fold CV)
+
+```bash
+bash run_cv.sh            # trains + tests every arch/fold, then runs aggregate.py and compare.py
+python compare.py --runs-dir ./runs --baseline unet   # redraw figures any time, no GPU or dataset needed
+```
+
+Per run, `runs/<arch>/fold<k>_seed<s>/` holds `test_results.json` (per-patient Dice, Dice without LCC, HD95),
+`test_masks.npz` (FLAIR, ground truth and predicted mask per test patient), `logs/history.csv` (per-epoch
+losses, val Dice, lr, time) and the checkpoint. Runs finished before `test_masks.npz` existed are back-filled by
+re-running `run_cv.sh` (inference only, no retraining).
+
+`compare.py` writes to `runs/figures/`:
+
+| File | Shows |
+|---|---|
+| `metric_distributions.png` | Per-patient Dice and HD95 per architecture (box + individual patients) |
+| `paired_dice_vs_baseline.png` | Each patient's Dice for an architecture vs the baseline; above the diagonal = better |
+| `fold_mean_dice.png` | Mean test Dice per fold and architecture |
+| `dice_vs_tumour_volume.png` | Per-patient Dice against ground-truth tumour size |
+| `training_curves.png` | Train loss, val loss and val Dice per epoch (mean ± std over folds) |
+| `segmentation_overview.png` | Worst / median / best test patients side by side for every architecture |
+| `segmentation/<patient>.png` | Per patient: largest-tumour, most-errors and tumour-edge slices; columns FLAIR, ground truth, each architecture |
+
+Overlay colours: green = correct, red = false positive, blue = missed, yellow = ground truth.
+
+### 6. Run tests
+
+```bash
+pip install pytest   # or: uv sync  (pytest is in the dev dependency group)
+pytest               # ~10 s on CPU; synthetic arrays only, no dataset or GPU needed
+```
+
 ---
 
 ## Configuration
@@ -125,6 +158,8 @@ All training hyperparameters are saved to `./tb_logs/config.json` at the start o
 .
 ├── train.py              # Training loop with TensorBoard logging
 ├── predict.py            # Inference, postprocessing, Dice evaluation
+├── compare.py            # Comparison figures across architectures (metrics, curves, segmentations)
+├── tests/                # pytest unit tests (metrics, preprocessing, splits, aggregation, comparison figures)
 ├── dataset.py            # MRISegmentationDataset (slice-level PyTorch Dataset)
 ├── network.py            # UNetModel
 ├── losses.py             # SoftDiceLoss
