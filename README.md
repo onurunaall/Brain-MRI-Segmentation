@@ -128,6 +128,13 @@ re-running `run_cv.sh` (inference only, no retraining).
 
 Overlay colours: green = correct, red = false positive, blue = missed, yellow = ground truth.
 
+### 6. Run tests
+
+```bash
+pip install pytest   # or: uv sync  (pytest is in the dev dependency group)
+pytest               # ~10 s on CPU; synthetic arrays only, no dataset or GPU needed
+```
+
 ---
 
 ## Configuration
@@ -152,6 +159,7 @@ All training hyperparameters are saved to `./tb_logs/config.json` at the start o
 ├── train.py              # Training loop with TensorBoard logging
 ├── predict.py            # Inference, postprocessing, Dice evaluation
 ├── compare.py            # Comparison figures across architectures (metrics, curves, segmentations)
+├── tests/                # pytest unit tests (metrics, preprocessing, splits, aggregation, comparison figures)
 ├── dataset.py            # MRISegmentationDataset (slice-level PyTorch Dataset)
 ├── network.py            # UNetModel
 ├── losses.py             # SoftDiceLoss
