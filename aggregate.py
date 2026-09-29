@@ -2,6 +2,7 @@
 Aggregate K-fold CV results into one comparison table.
 Usage: python aggregate.py --runs-dir ./runs --baseline unet
 Expects: <runs-dir>/<arch>/fold<k>_seed<s>/test_results.json and .../logs/train_summary.json
+--results-name summarizes another results file per run instead, e.g. test_results.fp16.engine.json (run_backend_eval.sh)
 """
 
 import argparse
@@ -9,7 +10,7 @@ import csv
 import glob
 import json
 import os
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import numpy as np
 from scipy.stats import wilcoxon
@@ -18,13 +19,18 @@ from scipy.stats import wilcoxon
 class ResultsAggregator:
     """Collects per-patient test metrics across folds/seeds and compares architectures."""
 
-    def __init__(self, runs_dir: str) -> None:
+    def __init__(self, runs_dir: str, results_name: str = "test_results.json") -> None:
+        """
+        :param runs_dir: Output folder of run_cv.sh
+        :param results_name: Per-run results file to summarize
+        """
         self.runs_dir = runs_dir
-        self.test_results: Dict[str, List[Dict]] = {}
-        self.train_summaries: Dict[str, List[Dict]] = {}
+        self.results_name = results_name
+        self.test_results: Dict[str, List[Dict[str, Any]]] = {}
+        self.train_summaries: Dict[str, List[Dict[str, Any]]] = {}
 
     def load(self) -> None:
-        pattern = os.path.join(self.runs_dir, "*", "fold*_seed*", "test_results.json")
+        pattern = os.path.join(self.runs_dir, "*", "fold*_seed*", self.results_name)
         for path in sorted(glob.glob(pattern)):
             with open(path) as fp:
                 res = json.load(fp)
@@ -50,8 +56,8 @@ class ResultsAggregator:
     def fold_means(self, arch: str) -> List[float]:
         return [float(np.mean([v["dice"] for v in res["per_patient"].values()])) for res in self.test_results[arch]]
 
-    def summarize(self, baseline: str) -> List[Dict]:
-        rows = []
+    def summarize(self, baseline: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
         base_dice = self.per_patient(baseline, "dice") if baseline in self.test_results else {}
 
         for arch in sorted(self.test_results):
@@ -89,7 +95,7 @@ class ResultsAggregator:
         return rows
 
     @staticmethod
-    def print_table(rows: List[Dict], baseline: str) -> None:
+    def print_table(rows: List[Dict[str, Any]], baseline: str) -> None:
         header = "| arch | runs | patients | Dice mean ± std | median | min | Dice (no LCC) | fold-mean std | HD95 median (vox) | Δ vs " + baseline + " | Wilcoxon p |"
         print(header)
         print("|" + "---|" * 11)
@@ -101,8 +107,8 @@ class ResultsAggregator:
                   f"{r['hd95_vox_median']:.2f} | {delta} | {pval} |")
 
     @staticmethod
-    def write_csv(rows: List[Dict], path: str) -> None:
-        keys = []
+    def write_csv(rows: List[Dict[str, Any]], path: str) -> None:
+        keys: List[str] = []
         for r in rows:
             for k in r:
                 if k not in keys:
@@ -118,12 +124,14 @@ class ResultsAggregator:
         parser.add_argument("--runs-dir", type=str, default="./runs")
         parser.add_argument("--baseline", type=str, default="unet")
         parser.add_argument("--csv", type=str, default="./runs/summary.csv")
+        parser.add_argument("--results-name", type=str, default="test_results.json",
+                            help="Per-run results file to summarize (default: test_results.json)")
         args = parser.parse_args()
 
-        agg = cls(args.runs_dir)
+        agg = cls(args.runs_dir, args.results_name)
         agg.load()
         if not agg.test_results:
-            raise SystemExit(f"No test_results.json found under {args.runs_dir}")
+            raise SystemExit(f"No {args.results_name} found under {args.runs_dir}")
         rows = agg.summarize(args.baseline)
         cls.print_table(rows, args.baseline)
         cls.write_csv(rows, args.csv)

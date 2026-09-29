@@ -6,7 +6,8 @@ import csv
 import json
 import os
 import sys
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -26,7 +27,7 @@ def write_run(runs_dir: str,
               seed: int,
               per_patient: Dict[str, Dict[str, float]],
               masks: Optional[Dict[str, np.ndarray]] = None,
-              history: Optional[list] = None) -> str:
+              history: Optional[List[List[float]]] = None) -> str:
     """
     Create one run folder in the layout run_cv.sh produces.
 
@@ -54,7 +55,10 @@ def write_run(runs_dir: str,
     return run_dir
 
 
-def patient_volume(n_slices: int = 5, size: int = 16, tumour_slices=(1, 2, 3), radius: int = 3):
+def patient_volume(n_slices: int = 5,
+                   size: int = 16,
+                   tumour_slices: Tuple[int, ...] = (1, 2, 3),
+                   radius: int = 3) -> Tuple[np.ndarray, np.ndarray]:
     """
     Synthetic (flair uint8, gt uint8) volume with a square 'tumour' on the given slices.
     Slice 2 gets the largest tumour, the outer tumour slices a smaller one.
@@ -70,5 +74,5 @@ def patient_volume(n_slices: int = 5, size: int = 16, tumour_slices=(1, 2, 3), r
 
 
 @pytest.fixture
-def runs_dir(tmp_path):
+def runs_dir(tmp_path: Path) -> str:
     return str(tmp_path / "runs")

@@ -1,3 +1,5 @@
+from typing import List, Tuple
+
 import matplotlib.patches as patches
 from matplotlib.patches import FancyArrowPatch
 import matplotlib.pyplot as plt
@@ -8,18 +10,18 @@ ax.axis("off")
 
 
 def draw_prism(
-    x,
-    y,
-    w,
-    h,
-    dx,
-    dy,
-    facecol="#A9C7E8",
-    topcol="#D4E5F7",
-    sidecol="#7B9EC7",
-    edgecol="#3B5F88",
-    lw=0.8,
-):
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    dx: float,
+    dy: float,
+    facecol: str = "#A9C7E8",
+    topcol: str = "#D4E5F7",
+    sidecol: str = "#7B9EC7",
+    edgecol: str = "#3B5F88",
+    lw: float = 0.8,
+) -> None:
     """Draws a standalone 3D isometric rectangular prism."""
     front = patches.Polygon(
         [[x, y], [x + w, y], [x + w, y + h], [x, y + h]],
@@ -61,21 +63,21 @@ def draw_prism(
 
 
 def draw_slab_stack(
-    x_start,
-    y,
-    num_slabs,
-    slab_w,
-    h,
-    dx,
-    dy,
-    gap=0.10,
-    facecol="#A9C7E8",
-    topcol="#D4E5F7",
-    sidecol="#7B9EC7",
-    edgecol="#3B5F88",
-):
+    x_start: float,
+    y: float,
+    num_slabs: int,
+    slab_w: float,
+    h: float,
+    dx: float,
+    dy: float,
+    gap: float = 0.10,
+    facecol: str = "#A9C7E8",
+    topcol: str = "#D4E5F7",
+    sidecol: str = "#7B9EC7",
+    edgecol: str = "#3B5F88",
+) -> Tuple[List[float], float]:
     """Draws a stack of discrete isometric slabs representing channel depth."""
-    centers = []
+    centers: List[float] = []
     for i in range(num_slabs):
         sx = x_start + i * (slab_w + gap)
         draw_prism(
@@ -96,8 +98,15 @@ def draw_slab_stack(
 
 
 def draw_arrow(
-    x1, y1, x2, y2, color="#404040", lw=2.2, mutation_scale=13, ls="-"
-):
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    color: str = "#404040",
+    lw: float = 2.2,
+    mutation_scale: float = 13,
+    ls: str = "-",
+) -> None:
     """Draws an arrow vector."""
     arrow = FancyArrowPatch(
         (x1, y1),

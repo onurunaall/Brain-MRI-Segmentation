@@ -197,9 +197,9 @@ def normalize_intensity(vol: npt.NDArray[np.float64],
     return vol
 
 
-def compose_visualization(mri_slice: npt.NDArray,
-                          gt_mask: npt.NDArray,
-                          pred_mask: npt.NDArray,
+def compose_visualization(mri_slice: torch.Tensor,
+                          gt_mask: torch.Tensor,
+                          pred_mask: torch.Tensor,
                           channel_idx: int = 1) -> List[npt.NDArray[np.uint8]]:
     """
     Generate overlay images with prediction and ground-truth contours for a batch.
