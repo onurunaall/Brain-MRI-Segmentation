@@ -1,12 +1,14 @@
 dependencies = ["torch"]
 
+from typing import Any
+
 import torch
 from network import UNetModel
 
 
 def unet_segmentation(pretrained: bool = False,
                       weights_path: str = "",
-                      **kwargs) -> UNetModel:
+                      **kwargs: Any) -> UNetModel:
     """
     Load the U-Net segmentation model, optionally from a local checkpoint.
 

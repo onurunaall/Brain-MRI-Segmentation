@@ -22,7 +22,20 @@ dependencies = [
 package = false
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "mypy>=2.3"]
+# ONNX export (torch.export-based exporter) and ONNX Runtime inference; for GPU inference replace
+# onnxruntime with onnxruntime-gpu (the two packages must not be installed together)
+onnx = ["onnx>=1.23", "onnxscript>=0.7", "onnxruntime>=1.23"]
+# TensorRT 11.3 runtime and builder (CUDA 13 wheels, matching the default PyTorch wheels; use tensorrt-cu12 with a
+# CUDA 12 build of PyTorch)
+tensorrt = ["tensorrt>=11.3,<12"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.10"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+ignore_missing_imports = true
+explicit_package_bases = true

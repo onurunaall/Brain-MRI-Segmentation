@@ -1,6 +1,10 @@
 """Tests for aggregate.ResultsAggregator."""
 
 import csv
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict
 
 import numpy as np
 import pytest
@@ -9,12 +13,12 @@ from aggregate import ResultsAggregator
 from conftest import write_run
 
 
-def _metrics(dice: float) -> dict:
+def _metrics(dice: float) -> Dict[str, float]:
     return {"dice": dice, "dice_raw": dice - 0.05, "hd95_vox": 10.0 * (1 - dice)}
 
 
 @pytest.fixture
-def two_arch_runs(runs_dir):
+def two_arch_runs(runs_dir: str) -> str:
     # unet: 2 folds x 2 patients. resunet: same patients, every Dice +0.1
     write_run(runs_dir, "unet", 0, 0, {"A": _metrics(0.5), "B": _metrics(0.7)})
     write_run(runs_dir, "unet", 1, 0, {"C": _metrics(0.6), "D": _metrics(0.8)})
@@ -23,13 +27,13 @@ def two_arch_runs(runs_dir):
     return runs_dir
 
 
-def _rows_by_arch(runs_dir: str) -> dict:
+def _rows_by_arch(runs_dir: str) -> Dict[str, Dict[str, Any]]:
     agg = ResultsAggregator(runs_dir)
     agg.load()
     return {r["arch"]: r for r in agg.summarize(baseline="unet")}
 
 
-def test_summary_statistics(two_arch_runs):
+def test_summary_statistics(two_arch_runs: str) -> None:
     rows = _rows_by_arch(two_arch_runs)
     unet = rows["unet"]
 
@@ -44,14 +48,14 @@ def test_summary_statistics(two_arch_runs):
     assert unet["fold_mean_std"] == pytest.approx(np.std([0.6, 0.7], ddof=1))
 
 
-def test_delta_vs_baseline(two_arch_runs):
+def test_delta_vs_baseline(two_arch_runs: str) -> None:
     rows = _rows_by_arch(two_arch_runs)
     assert "delta_vs_baseline" not in rows["unet"]
     assert rows["resunet"]["delta_vs_baseline"] == pytest.approx(0.1)
     assert 0.0 < rows["resunet"]["wilcoxon_p"] <= 1.0
 
 
-def test_identical_architectures_give_p_value_one(runs_dir):
+def test_identical_architectures_give_p_value_one(runs_dir: str) -> None:
     same = {"A": _metrics(0.5), "B": _metrics(0.7)}
     write_run(runs_dir, "unet", 0, 0, same)
     write_run(runs_dir, "resunet", 0, 0, same)
@@ -60,7 +64,7 @@ def test_identical_architectures_give_p_value_one(runs_dir):
     assert rows["resunet"]["wilcoxon_p"] == 1.0
 
 
-def test_seeds_are_averaged_per_patient(runs_dir):
+def test_seeds_are_averaged_per_patient(runs_dir: str) -> None:
     write_run(runs_dir, "unet", 0, 0, {"A": _metrics(0.4)})
     write_run(runs_dir, "unet", 0, 1, {"A": _metrics(0.8)})
     agg = ResultsAggregator(runs_dir)
@@ -68,7 +72,7 @@ def test_seeds_are_averaged_per_patient(runs_dir):
     assert agg.per_patient("unet", "dice") == {"A": pytest.approx(0.6)}
 
 
-def test_undefined_hd95_is_counted_not_averaged(runs_dir):
+def test_undefined_hd95_is_counted_not_averaged(runs_dir: str) -> None:
     write_run(runs_dir, "unet", 0, 0, {"A": {"dice": 0.0, "dice_raw": 0.0, "hd95_vox": float("nan")},
                                        "B": _metrics(0.8)})
     row = _rows_by_arch(runs_dir)["unet"]
@@ -76,7 +80,7 @@ def test_undefined_hd95_is_counted_not_averaged(runs_dir):
     assert row["hd95_vox_median"] == pytest.approx(2.0)
 
 
-def test_write_csv(two_arch_runs, tmp_path):
+def test_write_csv(two_arch_runs: str, tmp_path: Path) -> None:
     agg = ResultsAggregator(two_arch_runs)
     agg.load()
     rows = agg.summarize("unet")
@@ -87,3 +91,17 @@ def test_write_csv(two_arch_runs, tmp_path):
         read = list(csv.DictReader(fp))
     assert [r["arch"] for r in read] == [r["arch"] for r in rows]
     assert "delta_vs_baseline" in read[0]
+
+
+def test_results_name_selects_another_results_file(runs_dir: str) -> None:
+    run_dir = write_run(runs_dir, "unet", 0, 0, {"A": _metrics(0.5)})
+    with open(os.path.join(run_dir, "test_results.fp16.engine.json"), "w") as fp:
+        json.dump({"meta": {"arch": "unet", "fold": 0, "seed": 0}, "per_patient": {"A": _metrics(0.9)}}, fp)
+
+    default = ResultsAggregator(runs_dir)
+    default.load()
+    exported = ResultsAggregator(runs_dir, results_name="test_results.fp16.engine.json")
+    exported.load()
+
+    assert default.per_patient("unet", "dice") == {"A": pytest.approx(0.5)}
+    assert exported.per_patient("unet", "dice") == {"A": pytest.approx(0.9)}

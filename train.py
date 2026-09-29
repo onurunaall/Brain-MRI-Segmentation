@@ -3,7 +3,7 @@ import csv
 import json
 import os
 import time
-from typing import List, Tuple
+from typing import List, Tuple, cast
 
 import numpy as np
 import torch
@@ -16,6 +16,7 @@ from tb_logger import TensorBoardLogger
 from losses import SoftDiceLoss
 from augmentations import build_augmentation_pipeline
 from network import ModelFactory
+from inference import COMPILE_MODES, compile_model
 from utils import compose_visualization, dice_similarity_coefficient, Reproducibility
 
 
@@ -48,8 +49,9 @@ def _create_dataloaders(cfg: argparse.Namespace) -> Tuple[DataLoader, DataLoader
                         n_folds=cfg.n_folds)
 
     def _seed_worker(worker_id: int) -> None:
-        worker_seed = torch.utils.data.get_worker_info().seed % (2**32)
-        np.random.seed(worker_seed)
+        worker_info = torch.utils.data.get_worker_info()
+        assert worker_info is not None, "worker_init_fn only runs inside DataLoader workers"
+        np.random.seed(worker_info.seed % (2**32))
 
     # Use WeightedRandomSampler to bias towards slices with more foreground
     train_sampler = WeightedRandomSampler(weights=train_ds.sample_weights,
@@ -71,6 +73,11 @@ def _create_dataloaders(cfg: argparse.Namespace) -> Tuple[DataLoader, DataLoader
                             worker_init_fn=_seed_worker)
 
     return train_loader, val_loader
+
+
+def _segmentation_dataset(loader: DataLoader) -> SegDataset:
+    """The dataset behind a loader built by _create_dataloaders (typed for patient_ids / flat_index access)."""
+    return cast(SegDataset, loader.dataset)
 
 
 def _per_volume_dice(all_preds: List[np.ndarray],
@@ -143,10 +150,13 @@ def _print_run_header(cfg: argparse.Namespace,
     print(f"  Data split   : {split_desc}")
     print(f"  Train seed   : {cfg.seed}")
     print(f"  Device       : {device}")
-    print(f"  Train set    : {len(train_loader.dataset.patient_ids)} patients, "
-          f"{len(train_loader.dataset)} slices, {len(train_loader)} batches/epoch")
-    print(f"  Val set      : {len(val_loader.dataset.patient_ids)} patients, "
-          f"{len(val_loader.dataset)} slices, {len(val_loader)} batches/epoch")
+    print(f"  torch.compile: {cfg.compile}")
+    train_ds = _segmentation_dataset(train_loader)
+    val_ds = _segmentation_dataset(val_loader)
+    print(f"  Train set    : {len(train_ds.patient_ids)} patients, "
+          f"{len(train_ds)} slices, {len(train_loader)} batches/epoch")
+    print(f"  Val set      : {len(val_ds.patient_ids)} patients, "
+          f"{len(val_ds)} slices, {len(val_loader)} batches/epoch")
     print(f"  Schedule     : {cfg.epochs} epochs, batch size {cfg.batch_size}, "
           f"Adam lr {cfg.lr:g} with cosine decay")
     print(f"  Checkpoints  : {cfg.checkpoint_dir}")
@@ -197,9 +207,8 @@ def run_training(cfg: argparse.Namespace) -> None:
     _print_run_header(cfg, device, n_params, train_loader, val_loader)
     _print_metric_legend()
 
-    if hasattr(torch, "compile"):
-        model = torch.compile(model)
-    
+    model = compile_model(model, cfg.compile)
+
     criterion = SoftDiceLoss()
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
@@ -297,7 +306,7 @@ def run_training(cfg: argparse.Namespace) -> None:
 
                 vol_dice_scores = _per_volume_dice(val_predictions,
                                                    val_targets,
-                                                   val_loader.dataset.flat_index)
+                                                   _segmentation_dataset(val_loader).flat_index)
                 
                 mean_dice = float(np.mean(vol_dice_scores))
                 logger.log_scalar("val/dice", mean_dice, global_step)
@@ -328,7 +337,7 @@ def run_training(cfg: argparse.Namespace) -> None:
                 running_val_loss = []
         
         scheduler.step()
-        logger.log_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
+        logger.log_scalar("train/lr", float(scheduler.get_last_lr()[0]), global_step)
 
     logger.close()
 
@@ -338,14 +347,15 @@ def run_training(cfg: argparse.Namespace) -> None:
                "fold": cfg.fold,
                "seed": cfg.seed,
                "epochs": cfg.epochs,
+               "compile": cfg.compile,
                "best_val_dice": best_val_dice,
                "best_epoch": best_epoch,
                "train_seconds_total": elapsed,
                "seconds_per_epoch": elapsed / cfg.epochs,
                "peak_train_memory_mb": peak_mem_mb,
                "n_params": n_params,
-               "train_patients": train_loader.dataset.patient_ids,
-               "val_patients": val_loader.dataset.patient_ids}
+               "train_patients": _segmentation_dataset(train_loader).patient_ids,
+               "val_patients": _segmentation_dataset(val_loader).patient_ids}
 
     with open(os.path.join(cfg.log_dir, "train_summary.json"), "w") as fp:
         json.dump(summary, fp, indent=2)
@@ -378,6 +388,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n-folds", type=int, default=5, help="Number of CV folds (default: 5)")
     parser.add_argument("--n-validation", type=int, default=10, help="Validation patients for checkpoint selection (default: 10)")
     parser.add_argument("--split-seed", type=int, default=42, help="Patient split seed; keep fixed across runs (default: 42)")
+    parser.add_argument("--compile", type=str, nargs="?", const="default", default="default", choices=COMPILE_MODES,
+                        help="torch.compile mode, or 'none' for eager PyTorch (default: default)")
     return parser.parse_args()
 
 

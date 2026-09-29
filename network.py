@@ -1,5 +1,6 @@
 """ U-Net architecture for biomedical image segmentation """
 from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -124,6 +125,7 @@ class _ResidualBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(ch_out)
         self.act = nn.ReLU(inplace=True)
 
+        self.shortcut: nn.Module
         if ch_in == ch_out:
             self.shortcut = nn.Identity()
         else:
@@ -180,6 +182,8 @@ class ResUNetModel(nn.Module):
 class _WindowAttention(nn.Module):
     """Multi-head self-attention inside a window, with learned relative position bias."""
 
+    rel_index: torch.Tensor
+
     def __init__(self, dim: int, num_heads: int, ws: int) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -194,7 +198,7 @@ class _WindowAttention(nn.Module):
         rel = (coords[:, :, None] - coords[:, None, :]).permute(1, 2, 0) + (ws - 1)
         self.register_buffer("rel_index", rel[..., 0] * (2 * ws - 1) + rel[..., 1], persistent=False)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         bw, n, c = x.shape
         qkv = self.qkv(x).reshape(bw, n, 3, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -313,6 +317,7 @@ class _ConvResBlock(nn.Module):
         self.norm2 = nn.InstanceNorm2d(ch_out)
         self.act = nn.LeakyReLU(0.01, inplace=True)
 
+        self.shortcut: nn.Module
         if ch_in == ch_out:
             self.shortcut = nn.Identity()
         else:
@@ -344,7 +349,7 @@ class SwinUNETRModel(nn.Module):
     """
 
     def __init__(self, in_channels: int = 3, out_channels: int = 1, feature_size: int = 24,
-                 depths: tuple = (2, 2, 2, 2), num_heads: tuple = (3, 6, 12, 24),
+                 depths: Tuple[int, ...] = (2, 2, 2, 2), num_heads: Tuple[int, ...] = (3, 6, 12, 24),
                  window_size: int = 8) -> None:
         super().__init__()
         fs = feature_size
@@ -407,14 +412,14 @@ class ModelFactory:
     To add a model, add one entry to _registry. Callers never import model classes directly.
     """
 
-    _registry = {
+    _registry: Dict[str, Type[nn.Module]] = {
         "unet": UNetModel,
         "resunet": ResUNetModel,
         "swinunetr": SwinUNETRModel,
     }
 
     @classmethod
-    def available(cls) -> list:
+    def available(cls) -> List[str]:
         """Sorted list of registered architecture names (use for argparse choices)."""
         return sorted(cls._registry)
 

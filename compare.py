@@ -3,16 +3,18 @@ Comparison figures across architectures from finished CV runs (no GPU, no datase
 Usage: python compare.py --runs-dir ./runs --baseline unet
 Expects per run: <runs-dir>/<arch>/fold<k>_seed<s>/test_results.json, test_masks.npz (predict.py --masks-npz)
 and logs/history.csv (train.py). Runs without history.csv fall back to their TensorBoard event file.
-Writes figures to <runs-dir>/figures/ (or --out-dir).
+Writes figures to <runs-dir>/figures/ (or --out-dir), with one gallery folder per architecture.
 """
 
 import argparse
 import csv
 import glob
 import json
+import math
 import os
 import warnings
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Union
 
 import matplotlib
 matplotlib.use("Agg")
@@ -28,6 +30,25 @@ FN_COLOR = (0.1, 0.4, 1.0)
 GT_COLOR = (1.0, 0.85, 0.0)
 OVERLAY_ALPHA = 0.55
 TIE_TOLERANCE = 1e-3  # Dice differences below this count as ties in the paired plot
+GALLERY_COLUMNS = 10
+PROBABILITY_CMAP = "magma"
+GT_OUTLINE_COLOR = "cyan"
+
+# (patient id, mean Dice over architectures, FLAIR, ground truth, prediction per arch, shown slice)
+OverviewEntry = Tuple[str, float, np.ndarray, np.ndarray, Dict[str, np.ndarray], int]
+
+
+@dataclass
+class GalleryEntry:
+    """One test patient of one architecture, with the slice shown for it in the contact sheet."""
+    pid: str
+    fold: Optional[int]
+    dice: float
+    masks_path: str
+    slice_index: int
+    flair: np.ndarray
+    gt: np.ndarray
+    pred: np.ndarray
 
 
 class RunRecord:
@@ -251,6 +272,7 @@ class ComparisonPlotter:
         histories: Dict[str, List[Dict[str, np.ndarray]]] = {}
         n_fallback = 0
         for run in self.runs:
+            hist: Optional[Dict[str, np.ndarray]]
             if os.path.exists(run.history_path):
                 hist = self._read_history_csv(run.history_path)
             else:
@@ -324,7 +346,7 @@ class ComparisonPlotter:
         errors = sum(np.logical_xor(p, gt).reshape(gt.shape[0], -1).sum(axis=1) for p in preds)
         picks: List[Tuple[int, str]] = []
 
-        def add(idx: int, why: str) -> None:
+        def add(idx: Union[int, np.integer], why: str) -> None:
             if idx not in [p[0] for p in picks]:
                 picks.append((int(idx), why))
 
@@ -339,21 +361,38 @@ class ComparisonPlotter:
             add(gt.shape[0] // 2, "middle (no tumour, no predictions)")
         return picks
 
-    def _load_fold_masks(self, fold: Optional[int]) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, np.ndarray]]]:
-        """FLAIR+GT per patient and predictions per arch for one fold."""
-        flair_gt: Dict[str, np.ndarray] = {}
+    @staticmethod
+    def _read_masks(path: str) -> Dict[str, Dict[str, np.ndarray]]:
+        """test_masks.npz as patient_id -> {'flair', 'gt', 'pred'} (+ 'prob' if predict.py saved probabilities)."""
+        patients: Dict[str, Dict[str, np.ndarray]] = {}
+        with np.load(path) as npz:
+            for key in npz.files:
+                pid, kind = key.rsplit("__", 1)
+                patients.setdefault(pid, {})[kind] = npz[key]
+        return patients
+
+    @staticmethod
+    def _read_patient_masks(path: str, pid: str) -> Dict[str, np.ndarray]:
+        """The arrays of one patient from test_masks.npz, without loading the other patients."""
+        with np.load(path) as npz:
+            prefix = f"{pid}__"
+            return {key[len(prefix):]: npz[key] for key in npz.files if key.startswith(prefix)}
+
+    def _load_fold_masks(self, fold: Optional[int]) -> Tuple[Dict[str, Dict[str, np.ndarray]],
+                                                             Dict[str, Dict[str, np.ndarray]]]:
+        """FLAIR+GT per patient (from the first architecture that has them) and predictions per arch for one fold."""
+        flair_gt: Dict[str, Dict[str, np.ndarray]] = {}
         preds: Dict[str, Dict[str, np.ndarray]] = {}
         for arch in self.archs:
             run = self._mask_run(arch, fold)
             if run is None:
                 continue
-            with np.load(run.masks_path) as npz:
-                for key in npz.files:
-                    pid, kind = key.rsplit("__", 1)
-                    if kind == "pred":
-                        preds.setdefault(pid, {})[arch] = npz[key]
-                    elif pid not in flair_gt or kind not in flair_gt[pid]:
-                        flair_gt.setdefault(pid, {})[kind] = npz[key]
+            for pid, arrays in self._read_masks(run.masks_path).items():
+                if "pred" in arrays:
+                    preds.setdefault(pid, {})[arch] = arrays["pred"]
+                for kind in ("flair", "gt"):
+                    if kind in arrays:
+                        flair_gt.setdefault(pid, {}).setdefault(kind, arrays[kind])
         return flair_gt, preds
 
     def plot_segmentation_grids(self, max_patients: Optional[int]) -> None:
@@ -361,7 +400,7 @@ class ComparisonPlotter:
         seg_dir = os.path.join(self.out_dir, "segmentation")
         os.makedirs(seg_dir, exist_ok=True)
         dice_by_arch = {arch: self._per_patient(arch, "dice") for arch in self.archs}
-        overview: List[Tuple[str, float, np.ndarray, np.ndarray, Dict[str, np.ndarray], int]] = []
+        overview: List[OverviewEntry] = []
         n_written = 0
 
         for fold in sorted({r.fold for r in self.runs}, key=lambda f: (f is None, f)):
@@ -421,7 +460,10 @@ class ComparisonPlotter:
         fig.savefig(path, dpi=110)
         plt.close(fig)
 
-    def _draw_overview(self, overview, dice_by_arch: Dict[str, Dict[str, float]], n_each: int = 2) -> None:
+    def _draw_overview(self,
+                       overview: List[OverviewEntry],
+                       dice_by_arch: Dict[str, Dict[str, float]],
+                       n_each: int = 2) -> None:
         """Best / median / worst patients (by mean Dice over architectures) on their largest-tumour slice."""
         ranked = sorted([o for o in overview if not np.isnan(o[1])], key=lambda o: o[1])
         if not ranked:
@@ -439,8 +481,9 @@ class ComparisonPlotter:
         n_cols = 2 + len(self.archs)
         fig, axes = plt.subplots(len(rows), n_cols, figsize=(2.6 * n_cols, 2.7 * len(rows) + 0.8), squeeze=False)
         for r, (label, (pid, mean_dice, flair, gt, arch_preds, s)) in enumerate(rows):
-            panels = [("FLAIR", self._overlay(flair[s], np.zeros_like(gt[s]), None)),
-                      ("Ground truth", self._overlay(flair[s], gt[s], None))]
+            panels: List[Tuple[str, Optional[np.ndarray]]] = [
+                ("FLAIR", self._overlay(flair[s], np.zeros_like(gt[s]), None)),
+                ("Ground truth", self._overlay(flair[s], gt[s], None))]
             for arch in self.archs:
                 if arch in arch_preds:
                     panels.append((f"{arch}: {dice_by_arch[arch].get(pid, float('nan')):.3f}",
@@ -461,6 +504,141 @@ class ComparisonPlotter:
         fig.tight_layout(rect=(0, 0.04, 1, 0.97))
         self._save(fig, "segmentation_overview.png")
 
+    # ------------------------------------------------ per-architecture galleries
+
+    def plot_architecture_galleries(self, n_cases: int) -> None:
+        """
+        Per architecture, in <out-dir>/<arch>/:
+        all_patients.png - every test patient on its largest-tumour slice, lowest Dice first;
+        cases/<worstN|medianN|bestN>_<patient>.png - the n_cases worst, median and best patients, each on several
+        slices with the ground truth, the prediction errors and the probability map.
+        """
+        for arch in self.archs:
+            entries = self._gallery_entries(arch)
+            if not entries:
+                print(f"[Compare] skip {arch} gallery: no test_masks.npz found")
+                continue
+
+            ranked = sorted(entries, key=self._dice_rank_key)
+            cases_dir = os.path.join(self.out_dir, arch, "cases")
+            os.makedirs(cases_dir, exist_ok=True)
+
+            self._draw_contact_sheet(arch, ranked, os.path.join(self.out_dir, arch, "all_patients.png"))
+            cases = self._worst_median_best(ranked, n_cases)
+            for label, entry in cases:
+                self._draw_case(arch, label, entry, os.path.join(cases_dir, f"{label}_{entry.pid}.png"))
+            print(f"[Compare] wrote {arch} gallery ({len(entries)} patients, {len(cases)} cases) "
+                  f"-> {os.path.join(self.out_dir, arch)}")
+
+    def _gallery_entries(self, arch: str) -> List[GalleryEntry]:
+        """Every test patient of `arch` that has masks, scored with the Dice of the run whose masks are drawn."""
+        entries: List[GalleryEntry] = []
+        folds = sorted({r.fold for r in self.runs}, key=lambda f: (f is None, f))
+        for fold in folds:
+            run = self._mask_run(arch, fold)
+            if run is None:
+                continue
+            dice = run.per_patient("dice")
+            for pid, arrays in self._read_masks(run.masks_path).items():
+                gt, pred = arrays["gt"], arrays["pred"]
+                slice_index = self._pick_slices(gt, [pred])[0][0]
+                entries.append(GalleryEntry(pid=pid,
+                                            fold=fold,
+                                            dice=float(dice.get(pid, float("nan"))),
+                                            masks_path=run.masks_path,
+                                            slice_index=slice_index,
+                                            flair=arrays["flair"][slice_index],
+                                            gt=gt[slice_index],
+                                            pred=pred[slice_index]))
+        return entries
+
+    @staticmethod
+    def _dice_rank_key(entry: GalleryEntry) -> Tuple[bool, float]:
+        """Sort key: ascending Dice, patients without a Dice value last."""
+        return math.isnan(entry.dice), entry.dice
+
+    @staticmethod
+    def _worst_median_best(ranked: List[GalleryEntry], n: int) -> List[Tuple[str, GalleryEntry]]:
+        """(label, entry) for the n lowest, n middle and n highest Dice patients; each patient appears once."""
+        scored = [entry for entry in ranked if not math.isnan(entry.dice)]
+        middle_start = max(0, (len(scored) - n) // 2)
+        groups = [("worst", scored[:n]),
+                  ("median", scored[middle_start: middle_start + n]),
+                  ("best", scored[::-1][:n])]
+
+        chosen: List[Tuple[str, GalleryEntry]] = []
+        seen = set()
+        for label, group in groups:
+            for rank, entry in enumerate(group, start=1):
+                if entry.pid not in seen:
+                    seen.add(entry.pid)
+                    chosen.append((f"{label}{rank}", entry))
+        return chosen
+
+    def _draw_contact_sheet(self, arch: str, ranked: List[GalleryEntry], path: str) -> None:
+        n_cols = min(GALLERY_COLUMNS, len(ranked))
+        n_rows = math.ceil(len(ranked) / n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(1.9 * n_cols, 2.1 * n_rows + 0.9), squeeze=False)
+
+        for ax in axes.flat:
+            ax.axis("off")
+        for ax, entry in zip(axes.flat, ranked):
+            ax.imshow(self._overlay(entry.flair, entry.gt, entry.pred))
+            ax.set_title(f"{entry.pid}\nDice {entry.dice:.3f} | slice {entry.slice_index}", fontsize=6)
+
+        fig.suptitle(f"{arch}: every test patient, lowest Dice first "
+                     f"(largest-tumour slice; slice with most errors if there is no tumour)", fontsize=10)
+        fig.legend(handles=_legend_handles(), loc="lower center", ncol=4, fontsize=8, frameon=False)
+        fig.tight_layout(rect=(0, 0.03, 1, 0.97))
+        fig.savefig(path, dpi=110)
+        plt.close(fig)
+
+    def _draw_case(self, arch: str, label: str, entry: GalleryEntry, path: str) -> None:
+        """Rows = picked slices; columns = FLAIR | ground truth | prediction errors | probability (if saved)."""
+        arrays = self._read_patient_masks(entry.masks_path, entry.pid)
+        flair, gt, pred = arrays["flair"], arrays["gt"], arrays["pred"]
+        probability = arrays.get("prob")
+        picks = self._pick_slices(gt, [pred])
+
+        columns = ["FLAIR", "Ground truth", "Prediction"]
+        if probability is not None:
+            columns.append("Probability (cyan = ground truth)")
+        fig, axes = plt.subplots(len(picks), len(columns), squeeze=False, layout="constrained",
+                                 figsize=(2.8 * len(columns) + 0.6, 2.8 * len(picks) + 1.0))
+
+        heatmap = None
+        for row, (s, why) in enumerate(picks):
+            axes[row, 0].imshow(self._overlay(flair[s], np.zeros_like(gt[s]), None))
+            axes[row, 1].imshow(self._overlay(flair[s], gt[s], None))
+            axes[row, 2].imshow(self._overlay(flair[s], gt[s], pred[s]))
+            self._label_slice_dice(axes[row, 2], pred[s], gt[s])
+            if probability is not None:
+                heatmap = axes[row, 3].imshow(probability[s] / 255.0, cmap=PROBABILITY_CMAP, vmin=0.0, vmax=1.0)
+                if gt[s].any():
+                    axes[row, 3].contour(gt[s], levels=[0.5], colors=[GT_OUTLINE_COLOR], linewidths=0.8)
+            axes[row, 0].set_ylabel(f"slice {s}\n({why})", fontsize=8)
+
+        for ax in axes.flat:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        for col, title in enumerate(columns):
+            axes[0, col].set_title(title, fontsize=8)
+        if heatmap is not None:
+            fig.colorbar(heatmap, ax=axes[:, 3].tolist(), shrink=0.8, label="P(tumour)")
+
+        fold_txt = f"fold {entry.fold}" if entry.fold is not None else "no fold"
+        fig.suptitle(f"{arch} | {label} | {entry.pid} ({fold_txt}) | patient Dice {entry.dice:.3f}", fontsize=10)
+        fig.legend(handles=_legend_handles(), loc="outside lower center", ncol=4, fontsize=8, frameon=False)
+        fig.savefig(path, dpi=110)
+        plt.close(fig)
+
+    def _label_slice_dice(self, ax: plt.Axes, pred: np.ndarray, gt: np.ndarray) -> None:
+        """Write the slice Dice into the lower-left corner of a panel."""
+        slice_dice = self._slice_dice(pred.astype(bool), gt.astype(bool))
+        text = "slice Dice n/a (both empty)" if slice_dice is None else f"slice Dice {slice_dice:.3f}"
+        ax.text(0.02, 0.02, text, transform=ax.transAxes, fontsize=7, color="white", va="bottom",
+                bbox={"facecolor": "black", "alpha": 0.6, "linewidth": 0, "pad": 1.5})
+
     # ------------------------------------------------------------------- misc
 
     def _save(self, fig: plt.Figure, name: str) -> None:
@@ -479,6 +657,8 @@ class ComparisonPlotter:
                             help="Training seed whose masks are drawn (default: lowest available per arch/fold)")
         parser.add_argument("--max-patients", type=int, default=None,
                             help="Limit the number of per-patient segmentation figures (default: all)")
+        parser.add_argument("--gallery-cases", type=int, default=3,
+                            help="Worst, median and best patients drawn per architecture gallery (default: 3 each)")
         args = parser.parse_args()
 
         plotter = cls(args.runs_dir, args.out_dir or os.path.join(args.runs_dir, "figures"), args.baseline, args.seed)
@@ -489,6 +669,7 @@ class ComparisonPlotter:
         plotter.plot_dice_vs_volume()
         plotter.plot_training_curves()
         plotter.plot_segmentation_grids(args.max_patients)
+        plotter.plot_architecture_galleries(args.gallery_cases)
 
 
 def _legend_handles() -> List[Patch]:

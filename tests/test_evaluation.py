@@ -2,6 +2,8 @@
 
 import json
 import math
+from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import pytest
@@ -9,17 +11,17 @@ import pytest
 from evaluation import PatientEvaluator
 
 
-def test_strip_compile_prefix():
+def test_strip_compile_prefix() -> None:
     state = {"_orig_mod.enc1.weight": 1, "_orig_mod.head.bias": 2}
     assert dict(PatientEvaluator.strip_compile_prefix(state)) == {"enc1.weight": 1, "head.bias": 2}
 
 
-def test_strip_compile_prefix_is_noop_without_prefix():
+def test_strip_compile_prefix_is_noop_without_prefix() -> None:
     state = {"enc1.weight": 1}
     assert dict(PatientEvaluator.strip_compile_prefix(state)) == state
 
 
-def test_raw_dice_per_patient_groups_slices_by_patient():
+def test_raw_dice_per_patient_groups_slices_by_patient() -> None:
     # Patient A: 2 slices, perfect. Patient B: 1 slice, half overlap (Dice 0.5).
     gt_a = np.zeros((1, 4, 4), dtype=np.float32)
     gt_a[0, 1:3, 1:3] = 1
@@ -38,7 +40,7 @@ def test_raw_dice_per_patient_groups_slices_by_patient():
     assert scores["B"] == pytest.approx(0.5, abs=1e-6)
 
 
-def test_raw_dice_keeps_stray_components():
+def test_raw_dice_keeps_stray_components() -> None:
     """Unlike the reported metric, raw Dice does NOT apply largest-connected-component filtering."""
     gt = np.zeros((1, 8, 8), dtype=np.float32)
     gt[0, 1:3, 1:3] = 1
@@ -48,12 +50,12 @@ def test_raw_dice_keeps_stray_components():
     assert scores["A"] == pytest.approx(2 * 4 / (5 + 4), abs=1e-6)
 
 
-def _volume(pred: np.ndarray, gt: np.ndarray):
+def _volume(pred: np.ndarray, gt: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(input, pred, gt) tuple with the (Z, 1, H, W) layout predict.py builds."""
     return (np.zeros((pred.shape[0], 3) + pred.shape[1:]), pred[:, None], gt[:, None])
 
 
-def test_hd95_edge_cases():
+def test_hd95_edge_cases() -> None:
     empty = np.zeros((2, 8, 8), dtype=np.float32)
     blob = empty.copy()
     blob[1, 2:5, 2:5] = 1
@@ -69,7 +71,7 @@ def test_hd95_edge_cases():
     assert scores["identical"] == pytest.approx(0.0)
 
 
-def test_hd95_shifted_mask_is_positive():
+def test_hd95_shifted_mask_is_positive() -> None:
     gt = np.zeros((1, 12, 12), dtype=np.float32)
     gt[0, 2:6, 2:6] = 1
     pred = np.roll(gt, 4, axis=2)
@@ -77,7 +79,7 @@ def test_hd95_shifted_mask_is_positive():
     assert 0.0 < score <= 4.0 + 1e-6
 
 
-def test_write_results_schema(tmp_path):
+def test_write_results_schema(tmp_path: Path) -> None:
     path = tmp_path / "res.json"
     meta = {"arch": "unet", "fold": 0}
     PatientEvaluator.write_results(str(path), meta, {"A": 0.9}, {"A": 0.85}, {"A": 3.0})
