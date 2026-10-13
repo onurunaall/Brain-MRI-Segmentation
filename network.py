@@ -1,4 +1,4 @@
-""" U-Net architecture for biomedical image segmentation """
+""" U-Net architecture for biomedical image segmentation. Every model returns logits (no sigmoid). """
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -62,7 +62,7 @@ class UNetModel(nn.Module):
         Forward pass through the U-Net.
 
         :param x: Input tensor of shape (B, C, H, W)
-        :return: Sigmoid-activated segmentation map of shape (B, out_channels, H, W)
+        :return: Segmentation logits of shape (B, out_channels, H, W); torch.sigmoid gives probabilities
         """
         # Encoder
         e1 = self.enc_block1(x)
@@ -90,7 +90,7 @@ class UNetModel(nn.Module):
         d1 = torch.cat((d1, e1), dim=1)
         d1 = self.dec_block1(d1)
 
-        return torch.sigmoid(self.head(d1))
+        return self.head(d1)
 
     @staticmethod
     def _conv_block(ch_in: int, ch_out: int, tag: str) -> nn.Sequential:
@@ -176,7 +176,7 @@ class ResUNetModel(nn.Module):
         d2 = self.dec_block2(torch.cat((self.upsample2(d3), e2), dim=1))
         d1 = self.dec_block1(torch.cat((self.upsample1(d2), e1), dim=1))
 
-        return torch.sigmoid(self.head(d1))
+        return self.head(d1)
 
 
 class _WindowAttention(nn.Module):
@@ -403,7 +403,7 @@ class SwinUNETRModel(nn.Module):
         dec0 = self.decoder2(dec1, enc1)
         out = self.decoder1(dec0, enc0)
 
-        return torch.sigmoid(self.head(out))
+        return self.head(out)
 
 
 class ModelFactory:

@@ -9,6 +9,7 @@ from typing import Tuple, List, Optional
 import numpy as np
 import numpy.typing as npt
 from medpy.filter.binary import largest_connected_component
+from scipy import ndimage
 from skimage.exposure import rescale_intensity
 from skimage.transform import resize
 import torch
@@ -43,6 +44,43 @@ def dice_similarity_coefficient(prediction: npt.NDArray[np.float32],
         return 1.0
 
     return (2.0 * overlap + epsilon) / (total + epsilon)
+
+
+# Post-processing of a thresholded prediction volume, from removing nothing to removing the most; predict.py picks
+# one per model on the validation patients
+POSTPROCESS_METHODS: List[str] = ["none", "drop-small", "lcc"]
+SMALL_COMPONENT_FRACTION = 0.1  # 'drop-small' removes components below this fraction of the largest one
+
+
+def postprocess_mask(mask: npt.NDArray, method: str) -> npt.NDArray[np.bool_]:
+    """
+    Filter the 3D connected components of a binary prediction volume.
+
+    'lcc' can delete the whole tumour when a false-positive blob elsewhere is larger, and it always deletes
+    separate lesions, so it is one option among several rather than a fixed step.
+
+    :param mask: Binary prediction volume (components are connected across all axes, i.e. across slices too)
+    :param method: 'none' keeps every voxel, 'lcc' only the largest connected component,
+                   'drop-small' every component with at least SMALL_COMPONENT_FRACTION of the largest one's voxels
+    :return: Filtered boolean mask of the same shape
+    """
+    if method not in POSTPROCESS_METHODS:
+        raise ValueError(f"Unknown post-processing '{method}'. Choose from {POSTPROCESS_METHODS}")
+
+    mask = np.asarray(mask).astype(bool)
+    if method == "none" or not mask.any():
+        return mask
+
+    labels, _ = ndimage.label(mask)
+    sizes = np.bincount(labels.ravel())
+    sizes[0] = 0  # label 0 is the background
+
+    if method == "lcc":
+        return labels == np.argmax(sizes)  # first largest on ties, as medpy's largest_connected_component
+
+    keep = sizes >= SMALL_COMPONENT_FRACTION * sizes.max()
+    keep[0] = False
+    return keep[labels]
 
 
 def crop_to_content(sample: Tuple[npt.NDArray, npt.NDArray],

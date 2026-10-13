@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from utils import (crop_to_content, dice_similarity_coefficient, draw_contour, grayscale_to_rgb,
-                   normalize_intensity, pad_to_square, resize_volume)
+                   normalize_intensity, pad_to_square, postprocess_mask, resize_volume)
 
 
 # ------------------------------------------------------------------ Dice
@@ -67,6 +67,51 @@ class TestDiceSimilarityCoefficient:
         gt[0, 1:4, 1:4] = 1
         pred = gt * 0.6  # every tumour voxel just above threshold
         assert dice_similarity_coefficient(pred, gt) == pytest.approx(1.0)
+
+
+# ------------------------------------------------------- post-processing
+
+class TestPostprocessMask:
+
+    @staticmethod
+    def _three_blobs() -> np.ndarray:
+        """Separate 3D components of 27, 8 and 1 voxels."""
+        mask = np.zeros((4, 10, 10), dtype=bool)
+        mask[0:3, 1:4, 1:4] = True     # 27 voxels over 3 slices
+        mask[2:4, 7:9, 7:9] = True     # 8 voxels over 2 slices
+        mask[0, 9, 0] = True           # 1 voxel
+        return mask
+
+    def test_none_keeps_every_voxel(self) -> None:
+        mask = self._three_blobs()
+        np.testing.assert_array_equal(postprocess_mask(mask, "none"), mask)
+
+    def test_lcc_keeps_only_the_largest_3d_component(self) -> None:
+        out = postprocess_mask(self._three_blobs(), "lcc")
+        assert out.sum() == 27 and out[1, 2, 2]
+
+    def test_drop_small_keeps_components_of_at_least_10_percent_of_the_largest(self) -> None:
+        out = postprocess_mask(self._three_blobs(), "drop-small")
+        assert out.sum() == 27 + 8  # the 1-voxel speck is below 2.7 voxels and dropped
+        assert not out[0, 9, 0]
+
+    def test_lcc_matches_medpy_on_probability_volumes(self) -> None:
+        """postprocess_mask('lcc') reproduces the medpy-based filter it replaced in predict.py."""
+        from medpy.filter.binary import largest_connected_component
+
+        rng = np.random.default_rng(0)
+        probabilities = rng.uniform(size=(3, 1, 12, 12))
+        binary = probabilities > 0.5
+        np.testing.assert_array_equal(postprocess_mask(binary, "lcc"), largest_connected_component(binary))
+
+    def test_empty_mask_stays_empty(self) -> None:
+        empty = np.zeros((2, 4, 4), dtype=bool)
+        for method in ("none", "lcc", "drop-small"):
+            assert not postprocess_mask(empty, method).any()
+
+    def test_unknown_method_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown post-processing"):
+            postprocess_mask(np.zeros((1, 2, 2)), "largest")
 
 
 # --------------------------------------------------------- preprocessing

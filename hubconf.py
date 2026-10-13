@@ -14,8 +14,9 @@ def unet_segmentation(pretrained: bool = False,
 
     :param pretrained: If True, load weights from weights_path
     :param weights_path: Path to a .pt checkpoint file
-    :param kwargs: Forwarded to UNetModel (in_channels, out_channels, base_filters)
-    :return: UNetModel instance
+    :param kwargs: Forwarded to UNetModel (in_channels, out_channels, base_filters); models trained with
+                   --context-slices k need in_channels=3 * (2k + 1)
+    :return: UNetModel instance; it returns logits, apply torch.sigmoid for probabilities
     """
     model = UNetModel(**kwargs)
 

@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from dataset import MRISegmentationDataset as SegDataset
 from tb_logger import TensorBoardLogger
-from losses import SoftDiceLoss
+from losses import DiceBCELoss
 from augmentations import build_augmentation_pipeline
 from network import ModelFactory
 from inference import COMPILE_MODES, compile_model
@@ -29,7 +29,9 @@ def _create_dataloaders(cfg: argparse.Namespace) -> Tuple[DataLoader, DataLoader
     """
     augmentation = build_augmentation_pipeline(scale_range=cfg.aug_scale,
                                                rotation_deg=cfg.aug_angle,
-                                               flip_probability=0.5)
+                                               flip_probability=0.5,
+                                               brightness_range=cfg.aug_brightness,
+                                               gamma_range=cfg.aug_gamma)
 
     train_ds = SegDataset(data_root=cfg.data_dir,
                           split="train",
@@ -38,7 +40,8 @@ def _create_dataloaders(cfg: argparse.Namespace) -> Tuple[DataLoader, DataLoader
                           n_validation=cfg.n_validation,
                           seed=cfg.split_seed,
                           fold=cfg.fold,
-                          n_folds=cfg.n_folds)
+                          n_folds=cfg.n_folds,
+                          context_slices=cfg.context_slices)
 
     val_ds = SegDataset(data_root=cfg.data_dir,
                         split="validation",
@@ -46,7 +49,8 @@ def _create_dataloaders(cfg: argparse.Namespace) -> Tuple[DataLoader, DataLoader
                         n_validation=cfg.n_validation,
                         seed=cfg.split_seed,
                         fold=cfg.fold,
-                        n_folds=cfg.n_folds)
+                        n_folds=cfg.n_folds,
+                        context_slices=cfg.context_slices)
 
     def _seed_worker(worker_id: int) -> None:
         worker_info = torch.utils.data.get_worker_info()
@@ -84,9 +88,10 @@ def _per_volume_dice(all_preds: List[np.ndarray],
                      all_targets: List[np.ndarray],
                      flat_index: List[Tuple[int, int]]) -> List[float]:
     """
-    Compute Dice score per patient volume (not per slice).
+    Compute Dice score per patient volume (not per slice), thresholded at 0.5 and without post-processing:
+    largest-connected-component filtering can swap in a false-positive blob and make the score jump between epochs.
 
-    :param all_preds: Flat list of per-slice prediction arrays
+    :param all_preds: Flat list of per-slice probability arrays
     :param all_targets: Flat list of per-slice ground-truth arrays
     :param flat_index: Mapping from flat position → (patient_idx, slice_idx)
     :return: List of Dice scores, one per patient
@@ -96,9 +101,9 @@ def _per_volume_dice(all_preds: List[np.ndarray],
     offset = 0
 
     for n_slices in slices_per_patient:
-        vol_pred = np.array(all_preds[offset: offset + n_slices])
+        vol_pred = (np.array(all_preds[offset: offset + n_slices]) > 0.5).astype(np.float32)
         vol_true = np.array(all_targets[offset: offset + n_slices])
-        scores.append(dice_similarity_coefficient(vol_pred, vol_true))
+        scores.append(dice_similarity_coefficient(vol_pred, vol_true, apply_lcc=False))
         offset += n_slices
 
     return scores
@@ -147,6 +152,8 @@ def _print_run_header(cfg: argparse.Namespace,
 
     print("\n================ Run configuration ================")
     print(f"  Model        : {cfg.arch} ({n_params / 1e6:.2f} M parameters)")
+    print(f"  Input        : {SegDataset.num_input_channels(cfg.context_slices)} channels "
+          f"(the slice and {cfg.context_slices} neighbour slice(s) on each side)")
     print(f"  Data split   : {split_desc}")
     print(f"  Train seed   : {cfg.seed}")
     print(f"  Device       : {device}")
@@ -167,11 +174,11 @@ def _print_run_header(cfg: argparse.Namespace,
 def _print_metric_legend() -> None:
     """Explain the columns of the per-epoch summary line."""
     print("\nPer-epoch line columns:")
-    print("  train loss : mean soft-Dice loss (1 - Dice) over this epoch's training batches;")
+    print("  train loss : mean soft-Dice loss (1 - Dice) + binary cross-entropy over this epoch's training batches;")
     print("               computed with augmentation on, so not directly comparable to val loss. Lower = better.")
     print("  val loss   : same loss on the validation slices (no augmentation). Lower = better.")
-    print("  val Dice   : per-patient 3D Dice on the validation set after thresholding at 0.5")
-    print("               and keeping the largest connected component, averaged over patients.")
+    print("  val Dice   : per-patient 3D Dice on the validation set after thresholding at 0.5, without")
+    print("               post-processing (predict.py picks that later), averaged over patients.")
     print("               0 = no overlap, 1 = perfect. Higher = better. Used to pick the checkpoint.")
     print("  best       : highest val Dice so far and the epoch it was reached.")
     print("  NEW BEST   : val Dice improved -> model saved to best_model.pt (the model that gets tested).")
@@ -196,7 +203,7 @@ def run_training(cfg: argparse.Namespace) -> None:
 
     model = ModelFactory.create(
         cfg.arch,
-        in_channels=SegDataset.num_input_channels,
+        in_channels=SegDataset.num_input_channels(cfg.context_slices),
         out_channels=SegDataset.num_output_channels
     )
     
@@ -209,7 +216,8 @@ def run_training(cfg: argparse.Namespace) -> None:
 
     model = compile_model(model, cfg.compile)
 
-    criterion = SoftDiceLoss()
+    criterion = DiceBCELoss()
+    center_channels = SegDataset.center_slice_channels(cfg.context_slices)  # for the TensorBoard overlays
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
@@ -271,7 +279,8 @@ def run_training(cfg: argparse.Namespace) -> None:
                     if phase == "valid":
                         running_val_loss.append(batch_loss.item())
 
-                        preds_np = outputs.detach().cpu().numpy()
+                        probabilities = torch.sigmoid(outputs.float())  # the model returns logits
+                        preds_np = probabilities.detach().cpu().numpy()
                         val_predictions.extend(preds_np[s] for s in range(preds_np.shape[0]))
 
                         tgts_np = targets.detach().cpu().numpy()
@@ -282,9 +291,8 @@ def run_training(cfg: argparse.Namespace) -> None:
                             vis_tag = f"image/{batch_idx}"
                             n_remaining = cfg.n_vis_images - batch_idx * cfg.batch_size
 
-                            logger.log_image_batch(vis_tag,
-                                                   compose_visualization(inputs, targets, outputs)[:n_remaining],
-                                                   global_step)
+                            overlays = compose_visualization(inputs[:, center_channels], targets, probabilities)
+                            logger.log_image_batch(vis_tag, overlays[:n_remaining], global_step)
 
                     if phase == "train":
                         running_train_loss.append(batch_loss.item())
@@ -382,6 +390,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=256, help="Target spatial resolution (default: 256)")
     parser.add_argument("--aug-scale", type=float, default=0.05, help="Scale augmentation range (default: 0.05)")
     parser.add_argument("--aug-angle", type=float, default=15.0, help="Rotation augmentation range in degrees (default: 15)")
+    parser.add_argument("--aug-brightness", type=float, default=0.2,
+                        help="Per-channel intensity factor range, e.g. 0.2 -> [0.8, 1.2]; 0 disables (default: 0.2)")
+    parser.add_argument("--aug-gamma", type=float, default=0.4,
+                        help="Per-channel gamma range g: gamma in [1/(1+g), 1+g]; 0 disables (default: 0.4)")
+    parser.add_argument("--context-slices", type=int, default=1,
+                        help="Neighbour slices on each side given as extra input channels (2.5D); 0 = plain 2D "
+                             "(default: 1)")
     parser.add_argument("--arch", type=str, default="unet", choices=ModelFactory.available(), help="Model architecture (default: unet)")
     parser.add_argument("--seed", type=int, default=0, help="Training seed: weight init, sampling, augmentation (default: 0)")
     parser.add_argument("--fold", type=int, default=None, help="Test fold index for K-fold CV (default: None = old 100/10 split)")

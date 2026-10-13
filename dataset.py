@@ -73,9 +73,20 @@ class MRISegmentationDataset(Dataset):
     as (image_tensor, mask_tensor) pairs.
     """
 
-    # Channel configuration for the U-Net
-    num_input_channels: int = 3
+    # Channel configuration for the U-Net: each slice has pre-contrast, FLAIR and post-contrast channels
+    channels_per_slice: int = 3
     num_output_channels: int = 1
+
+    @classmethod
+    def num_input_channels(cls, context_slices: int) -> int:
+        """Model input channels: the slice itself plus `context_slices` neighbours on each side (2.5D input)."""
+        return cls.channels_per_slice * (2 * context_slices + 1)
+
+    @classmethod
+    def center_slice_channels(cls, context_slices: int) -> slice:
+        """The input channels of the slice being segmented (its FLAIR is the middle one of these)."""
+        start = cls.channels_per_slice * context_slices
+        return slice(start, start + cls.channels_per_slice)
 
     def __init__(self,
                  data_root: str,
@@ -85,7 +96,8 @@ class MRISegmentationDataset(Dataset):
                  n_validation: int = 10,
                  seed: int = 42,
                  fold: Optional[int] = None,
-                 n_folds: int = 5) -> None:
+                 n_folds: int = 5,
+                 context_slices: int = 0) -> None:
         """
         :param data_root: Root directory containing per-patient subdirectories with .tif slices
         :param transform: Optional augmentation callable operating on (image, mask) tuples
@@ -95,10 +107,15 @@ class MRISegmentationDataset(Dataset):
         :param seed: Random seed for reproducible train/val splitting
         :param fold: If given, use K-fold splitting (PatientSplitter) and treat this fold as test
         :param n_folds: Number of folds when fold is given
+        :param context_slices: Neighbouring slices added on each side as extra channels (0 = plain 2D input).
+                               Neighbours outside the volume are filled with the volume's background value.
         """
         assert split in ("all", "train", "validation", "test"), f"Unknown split: {split}"
         if split == "test" and fold is None:
             raise ValueError("split='test' requires fold to be set")
+        if context_slices < 0:
+            raise ValueError(f"context_slices must be >= 0, got {context_slices}")
+        self.context_slices = context_slices
 
         patient_dirs: dict[str, str] = {}
         
@@ -173,19 +190,21 @@ class MRISegmentationDataset(Dataset):
 
         paired = [(normalize_intensity(vol), seg) for vol, seg in paired]
 
-        # Slice sampling weights (favour slices with more foreground)
-        # These weights are per-slice probabilities suitable for WeightedRandomSampler.
+        # Slice sampling weights for WeightedRandomSampler; each patient's weights sum to 1.
+        # Half of a patient's weight follows tumour area, the other half is spread evenly over its slices, so
+        # tumour-free slices (about 60% of the data) are about 30% of training samples. A patient without
+        # tumour gets uniform weights.
         patient_slice_weights: List[npt.NDArray] = []
-        
+
         for _, seg in paired:
             area_per_slice = seg.sum(axis=-1).sum(axis=-1)
-           
-            total = area_per_slice.sum()
-            floor = total * 0.1 / max(len(area_per_slice), 1)
-            weights = (area_per_slice + floor) / max(total * 1.1, 1e-6)
+            floor = max(area_per_slice.sum(), 1.0) / len(area_per_slice)
+            weights = (area_per_slice + floor) / (area_per_slice + floor).sum()
             patient_slice_weights.append(weights)
 
         self.volumes = [(vol, seg[..., np.newaxis]) for vol, seg in paired]
+        # Per-channel background value of each volume, used for context slices beyond the volume's ends
+        self.backgrounds = [vol.min(axis=(0, 1, 2)) for vol, _ in self.volumes]
 
         n_slices_total = sum(vol.shape[0] for vol, _ in self.volumes)
         n_tumor_slices = sum(int(np.count_nonzero(seg.reshape(seg.shape[0], -1).any(axis=1)))
@@ -214,9 +233,8 @@ class MRISegmentationDataset(Dataset):
                     idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         p_idx, s_idx = self.flat_index[idx]
 
-        vol, seg = self.volumes[p_idx]
-        img_slice = vol[s_idx]
-        msk_slice = seg[s_idx]
+        img_slice = self._with_context(p_idx, s_idx)
+        msk_slice = self.volumes[p_idx][1][s_idx]
 
         if self.transform is not None:
             img_slice, msk_slice = self.transform((img_slice, msk_slice))
@@ -228,7 +246,25 @@ class MRISegmentationDataset(Dataset):
         msk_tensor = torch.from_numpy(msk_slice.astype(np.float32))
 
         return img_tensor, msk_tensor
-    
+
+    def _with_context(self, p_idx: int, s_idx: int) -> npt.NDArray:
+        """
+        Slice s_idx of patient p_idx with its neighbours stacked along the channel axis.
+
+        :return: (H, W, channels_per_slice * (2 * context_slices + 1)) array, neighbours in slice order
+        """
+        vol = self.volumes[p_idx][0]
+        if self.context_slices == 0:
+            return vol[s_idx]
+
+        stacked = []
+        for z in range(s_idx - self.context_slices, s_idx + self.context_slices + 1):
+            if 0 <= z < vol.shape[0]:
+                stacked.append(vol[z])
+            else:
+                stacked.append(np.broadcast_to(self.backgrounds[p_idx], vol.shape[1:]))
+        return np.concatenate(stacked, axis=-1)
+
     @staticmethod
     def _slice_index_from_filename(fname: str) -> int:
         try:

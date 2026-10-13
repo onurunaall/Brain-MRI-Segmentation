@@ -115,7 +115,7 @@ class ComparisonPlotter:
     def plot_metric_distributions(self) -> None:
         """Box + individual points of per-patient Dice and HD95 for every architecture."""
         fig, axes = plt.subplots(1, 2, figsize=(6 + 2.5 * len(self.archs), 5))
-        specs = [("dice", "Dice per patient (LCC)", axes[0]),
+        specs = [("dice", "Dice per patient (post-processed)", axes[0]),
                  ("hd95_vox", "HD95 per patient (voxels, lower = better)", axes[1])]
         rng = np.random.default_rng(0)
 
@@ -218,7 +218,7 @@ class ComparisonPlotter:
             ax.scatter([volumes[p] for p in pids], [dice[p] for p in pids], s=16, alpha=0.7, label=arch)
         ax.set_xscale("symlog", linthresh=100)
         ax.set_xlabel("Ground-truth tumour volume (voxels on the resized grid, not mm³)")
-        ax.set_ylabel("Dice (LCC)")
+        ax.set_ylabel("Dice (post-processed)")
         ax.set_ylim(-0.02, 1.02)
         ax.set_title("Dice vs tumour size")
         ax.legend()
@@ -288,9 +288,9 @@ class ComparisonPlotter:
             print(f"[Compare] {n_fallback} run(s) had no history.csv; used TensorBoard "
                   f"(train loss there is approximate)")
 
-        panels = [("train_loss", "Train loss (soft Dice, with augmentation)"),
+        panels = [("train_loss", "Train loss (with augmentation)"),
                   ("val_loss", "Validation loss"),
-                  ("val_dice", "Validation Dice (per patient, LCC)")]
+                  ("val_dice", "Validation Dice (per patient)")]
         fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
         for ax, (key, title) in zip(axes, panels):
             for arch in self.archs:

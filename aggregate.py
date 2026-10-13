@@ -96,7 +96,7 @@ class ResultsAggregator:
 
     @staticmethod
     def print_table(rows: List[Dict[str, Any]], baseline: str) -> None:
-        header = "| arch | runs | patients | Dice mean ± std | median | min | Dice (no LCC) | fold-mean std | HD95 median (vox) | Δ vs " + baseline + " | Wilcoxon p |"
+        header = "| arch | runs | patients | Dice mean ± std | median | min | Dice (no post-processing) | fold-mean std | HD95 median (vox) | Δ vs " + baseline + " | Wilcoxon p |"
         print(header)
         print("|" + "---|" * 11)
         for r in rows:

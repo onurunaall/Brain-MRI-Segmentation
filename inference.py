@@ -38,20 +38,28 @@ def compile_model(model: nn.Module, mode: str) -> nn.Module:
     return cast(nn.Module, torch.compile(model, mode=mode))
 
 
-def load_trained_model(arch: str, checkpoint_path: str, device: torch.device) -> nn.Module:
+def load_trained_model(arch: str,
+                       checkpoint_path: str,
+                       device: torch.device,
+                       context_slices: int = 0) -> nn.Module:
     """
     Build the architecture and load a checkpoint saved by train.py (or a bundle's model.pt).
 
     :param arch: Architecture name registered in ModelFactory
     :param checkpoint_path: Path to a state_dict .pt file
     :param device: Device to load the model onto
-    :return: The model in eval mode on `device`
+    :param context_slices: Neighbour slices per side the model was trained with (train.py --context-slices)
+    :return: The model (returning logits) in eval mode on `device`
     """
     model = ModelFactory.create(arch,
-                                in_channels=SegDataset.num_input_channels,
+                                in_channels=SegDataset.num_input_channels(context_slices),
                                 out_channels=SegDataset.num_output_channels)
     state = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model.load_state_dict(PatientEvaluator.strip_compile_prefix(state))
+    try:
+        model.load_state_dict(PatientEvaluator.strip_compile_prefix(state))
+    except RuntimeError as exc:
+        raise RuntimeError(f"{checkpoint_path} does not fit a {arch} with --context-slices {context_slices}; "
+                           f"pass the value it was trained with (models trained before 2.5D input need 0)") from exc
     return model.to(device).eval()
 
 
@@ -86,8 +94,8 @@ class PyTorchBackend(InferenceBackend):
 
     def predict(self, images: torch.Tensor) -> torch.Tensor:
         with torch.no_grad(), torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
-            probabilities = self.model(images.to(self.device))
-        return probabilities.float().to(images.device)
+            logits = self.model(images.to(self.device))
+        return torch.sigmoid(logits.float()).to(images.device)
 
 
 class OnnxRuntimeBackend(InferenceBackend):
@@ -211,7 +219,8 @@ def create_backend(model_path: str,
                    arch: str,
                    device: torch.device,
                    compile_mode: str = "none",
-                   use_amp: bool = False) -> InferenceBackend:
+                   use_amp: bool = False,
+                   context_slices: int = 0) -> InferenceBackend:
     """
     Pick the backend from the file type: .pt checkpoint -> PyTorch, .onnx -> ONNX Runtime, .engine/.plan -> TensorRT.
 
@@ -220,11 +229,14 @@ def create_backend(model_path: str,
     :param device: Device to run on
     :param compile_mode: torch.compile mode; only valid for .pt checkpoints
     :param use_amp: fp16 autocast; only valid for .pt checkpoints (ONNX / TensorRT precision is fixed at export)
+    :param context_slices: Neighbour slices per side (only used to rebuild the network for .pt checkpoints;
+                           exported files have their input shape built in)
     :return: Backend ready for predict()
     """
     extension = os.path.splitext(model_path)[1].lower()
     if extension == ".pt":
-        return PyTorchBackend(load_trained_model(arch, model_path, device), device, compile_mode, use_amp)
+        model = load_trained_model(arch, model_path, device, context_slices)
+        return PyTorchBackend(model, device, compile_mode, use_amp)
 
     if compile_mode != "none" or use_amp:
         raise ValueError("--compile and --amp only apply to .pt checkpoints; the precision of ONNX and "
@@ -267,5 +279,7 @@ def load_bundle(bundle_dir: str,
         path = os.path.join(bundle_dir, member["name"], file_name)
         if not os.path.exists(path):
             raise FileNotFoundError(f"{path} does not exist; export it with export_models.py --formats")
-        members.append(create_backend(path, manifest["arch"], device, compile_mode, use_amp))
+        # Bundles written before 2.5D input have no context_slices entry: their models take one slice
+        members.append(create_backend(path, manifest["arch"], device, compile_mode, use_amp,
+                                      manifest.get("context_slices", 0)))
     return EnsembleBackend(members), manifest

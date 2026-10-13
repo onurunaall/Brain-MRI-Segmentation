@@ -38,7 +38,8 @@ class ModelBenchmark:
                  use_amp: bool,
                  compile_mode: str,
                  export_dir: str,
-                 allow_tf32: bool) -> None:
+                 allow_tf32: bool,
+                 context_slices: int) -> None:
         """
         :param device: Device to benchmark on
         :param image_size: Spatial size H = W of the random input
@@ -48,6 +49,7 @@ class ModelBenchmark:
         :param compile_mode: torch.compile mode for the 'pytorch' backend
         :param export_dir: Folder for the ONNX files and TensorRT engines built for the benchmark
         :param allow_tf32: Allow TF32 in fp32 TensorRT engines
+        :param context_slices: Neighbour slices per side in the model input (sets the input channel count)
         """
         self.device = device
         self.image_size = image_size
@@ -57,10 +59,10 @@ class ModelBenchmark:
         self.compile_mode = compile_mode
         self.export_dir = export_dir
         self.allow_tf32 = allow_tf32
+        self.in_channels = SegDataset.num_input_channels(context_slices)
 
     def _input(self, batch_size: int) -> torch.Tensor:
-        return torch.randn(batch_size, SegDataset.num_input_channels,
-                           self.image_size, self.image_size, device=self.device)
+        return torch.randn(batch_size, self.in_channels, self.image_size, self.image_size, device=self.device)
 
     def _sync(self) -> None:
         if self.device.type == "cuda":
@@ -123,7 +125,7 @@ class ModelBenchmark:
 
     def run(self, arch: str, batch_sizes: List[int], backends: List[str]) -> Dict[str, Any]:
         model = ModelFactory.create(arch,
-                                    in_channels=SegDataset.num_input_channels,
+                                    in_channels=self.in_channels,
                                     out_channels=SegDataset.num_output_channels)
         model.to(self.device).eval()
 
@@ -151,7 +153,7 @@ class ModelBenchmark:
         os.makedirs(arch_dir, exist_ok=True)
         precision, kind = name.split(".")
         onnx_path = os.path.join(arch_dir, f"model.{precision}.onnx")
-        ModelExporter.export_onnx(model, onnx_path, self.image_size, precision)
+        ModelExporter.export_onnx(model, onnx_path, self.image_size, precision, self.in_channels)
         if kind == "onnx":
             return create_backend(onnx_path, arch, self.device)
 
@@ -173,6 +175,8 @@ class ModelBenchmark:
                             help="'pytorch' and/or export formats (default: pytorch)")
         parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 16])
         parser.add_argument("--image-size", type=int, default=256)
+        parser.add_argument("--context-slices", type=int, default=1,
+                            help="Neighbour slices per side in the model input, as train.py (default: 1)")
         parser.add_argument("--warmup-iters", type=int, default=20)
         parser.add_argument("--timed-iters", type=int, default=100)
         parser.add_argument("--no-amp", action="store_true",
@@ -189,13 +193,14 @@ class ModelBenchmark:
         device = torch.device("cpu" if not torch.cuda.is_available() else args.device)
         bench = cls(device, args.image_size, args.warmup_iters, args.timed_iters,
                     use_amp=not args.no_amp, compile_mode=args.compile, export_dir=args.export_dir,
-                    allow_tf32=not args.no_tf32)
+                    allow_tf32=not args.no_tf32, context_slices=args.context_slices)
 
         env: Dict[str, Any] = {"device": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
                                "torch": torch.__version__,
                                "amp": bench.use_amp,
                                "compile": args.compile,
                                "image_size": args.image_size,
+                               "context_slices": args.context_slices,
                                "notes": ["'amp' and 'compile' apply to the 'pytorch' backend only",
                                          "peak_inference_memory_mb counts PyTorch's allocator only, so it is "
                                          "reported for the 'pytorch' backend only",

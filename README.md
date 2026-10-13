@@ -21,13 +21,13 @@ Standard U-Net with four encoder stages, a bottleneck, and four symmetric decode
 | Decoder 3 | 128 | 64 × 64 |
 | Decoder 2 | 64 | 128 × 128 |
 | Decoder 1 | 32 | 256 × 256 |
-| Output head | 1 (sigmoid) | 256 × 256 |
+| Output head | 1 (logit; sigmoid applied in the loss and at inference) | 256 × 256 |
 
 ---
 
 ## Dataset
 
-The [LGG Segmentation Dataset](https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation) contains brain MRI scans from 110 patients with lower-grade glioma from The Cancer Genome Atlas (TCGA). Each patient folder has multi-sequence MRI (pre-contrast T1, FLAIR, post-contrast T1) with expert-annotated tumour masks. The model takes all three channels as input and predicts a single binary segmentation mask.
+The [LGG Segmentation Dataset](https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation) contains brain MRI scans from 110 patients with lower-grade glioma from The Cancer Genome Atlas (TCGA). Each patient folder has multi-sequence MRI (pre-contrast T1, FLAIR, post-contrast T1) with expert-annotated tumour masks. The model takes all three channels of a slice as input, plus the three channels of one neighbouring slice on each side (2.5D input, `--context-slices 1`, 9 channels; neighbours beyond the first or last slice are filled with background), and predicts a single binary segmentation mask for the middle slice. The neighbours tell the model where in the head it is, which matters at the skull base and the top of the head.
 
 **Split:** 100 patients training / 10 patients validation (random, seed 42).
 
@@ -92,8 +92,12 @@ python train.py \
   --compile default        # torch.compile mode: none | default | reduce-overhead | max-autotune | max-autotune-no-cudagraphs
 ```
 
-The best checkpoint is saved to `./checkpoints/best_model.pt` whenever validation Dice improves.
-It is always saved from the uncompiled model, so it loads with or without `torch.compile`.
+The best checkpoint is saved to `./checkpoints/best_model.pt` whenever validation Dice improves (per patient,
+thresholded at 0.5, without post-processing). It is always saved from the uncompiled model, so it loads with or without
+`torch.compile`.
+
+Training samples slices so that half of each patient's weight follows tumour area and half is spread over all its
+slices: tumour-free slices are about 30% of training samples, so the model learns to predict nothing on them.
 
 ### 4. Run inference
 
@@ -109,6 +113,13 @@ The backend follows the model file: `.pt` → PyTorch (add `--compile` and/or `-
 autocast), `.onnx` → ONNX Runtime, `.engine` / `.plan` → TensorRT. Checkpoints saved from a `torch.compile`d model
 (`_orig_mod.` key prefix) are loaded directly; `fix_model.py` is no longer needed.
 
+`--context-slices` must match training (default 1; models trained before 2.5D input need `--context-slices 0`).
+`--postprocess` sets the connected-component filtering of the thresholded prediction: `none`, `drop-small` (drop 3D
+components smaller than 10% of the largest) or `lcc` (keep only the largest 3D component). The default `auto` picks
+the one with the best mean Dice on the validation patients of `--fold` and records it in the results JSON. `lcc` used
+to be fixed, but it deletes the whole tumour when a false-positive blob is larger, and it always deletes separate
+lesions.
+
 ### 5. Compare architectures (K-fold CV)
 
 ```bash
@@ -116,11 +127,15 @@ bash run_cv.sh            # trains + tests every arch/fold, runs aggregate.py an
 python compare.py --runs-dir ./runs --baseline unet   # redraw figures any time, no GPU or dataset needed
 ```
 
-`run_cv.sh` reads `ARCHS`, `FOLDS`, `SEEDS`, `EPOCHS`, `DATA_DIR`, `RUNS_DIR`, `MODELS_DIR`, `COMPILE` (torch.compile
-mode for training, default `default`) and `EXPORT_FORMATS` (see [ONNX and TensorRT](#8-onnx-and-tensorrt)) from the
-environment, e.g. `COMPILE=none EXPORT_FORMATS="fp32.onnx fp16.engine" bash run_cv.sh`.
+`run_cv.sh` reads `ARCHS`, `FOLDS`, `SEEDS` (default `0 1 2`: three training seeds per fold, so architecture
+differences can be told apart from seed noise), `EPOCHS`, `CONTEXT_SLICES` (default 1), `DATA_DIR`, `RUNS_DIR`,
+`MODELS_DIR`, `COMPILE` (torch.compile mode for training, default `default`) and `EXPORT_FORMATS` (see
+[ONNX and TensorRT](#8-onnx-and-tensorrt)) from the environment, e.g.
+`COMPILE=none EXPORT_FORMATS="fp32.onnx fp16.engine" bash run_cv.sh`. Finished runs are skipped, so train with changed
+settings into a new folder, e.g. `RUNS_DIR=./runs_v2 MODELS_DIR=./models_v2 bash run_cv.sh`.
 
-Per run, `runs/<arch>/fold<k>_seed<s>/` holds `test_results.json` (per-patient Dice, Dice without LCC, HD95),
+Per run, `runs/<arch>/fold<k>_seed<s>/` holds `test_results.json` (per-patient Dice after the chosen post-processing,
+Dice without post-processing, HD95; the chosen method and its validation scores are in `meta`),
 `test_masks.npz` (FLAIR, ground truth, predicted mask and probability map per test patient), `logs/history.csv`
 (per-epoch losses, val Dice, lr, time) and the checkpoint. Runs finished before `test_masks.npz` existed are back-filled by
 re-running `run_cv.sh` (inference only, no retraining).
@@ -148,7 +163,7 @@ K-fold CV trains one model per fold, and each fold's test Dice is measured on pa
 `export_models.py` (run at the end of `run_cv.sh`) copies all fold models of an architecture into one bundle:
 
 ```
-models/<arch>/manifest.json            # arch, image size; per member: fold, seed, val Dice, best epoch (0-based), held-out test Dice
+models/<arch>/manifest.json            # arch, image size, context slices; per member: fold, seed, val Dice, best epoch (0-based), held-out test Dice, chosen post-processing
 models/<arch>/fold<k>_seed<s>/model.pt # plus model.fp32.onnx, model.fp16.engine, ... when exported
 ```
 
@@ -156,9 +171,12 @@ models/<arch>/fold<k>_seed<s>/model.pt # plus model.fp32.onnx, model.fp16.engine
 Kaggle folder layout:
 
 ```bash
-python predict.py --bundle-dir ./models/unet --split all --data-dir ./new_patients --output-dir ./new_predictions
-python predict.py --bundle-dir ./models/unet --bundle-file model.fp16.engine --split all --data-dir ./new_patients
+python predict.py --bundle-dir ./models/unet --split all --postprocess lcc --data-dir ./new_patients --output-dir ./new_predictions
+python predict.py --bundle-dir ./models/unet --bundle-file model.fp16.engine --split all --postprocess lcc --data-dir ./new_patients
 ```
+
+`--split all` has no validation patients to choose the post-processing on, so pass it explicitly: use the method most
+members chose (`postprocess` per member in `manifest.json`; `lcc` above is only an example).
 
 The ensemble is refused on `--split validation/test`: every CV patient was a training patient of the other folds'
 models, so any score there would be inflated. The CV results in `summary.csv` estimate the performance of a single
@@ -225,6 +243,9 @@ All training hyperparameters are saved to `./tb_logs/config.json` at the start o
 | `image_size` | 256 | Spatial resolution after preprocessing |
 | `aug_scale` | 0.05 | Random scale range ±5% |
 | `aug_angle` | 15.0 | Random rotation ±15° |
+| `aug_brightness` | 0.2 | Per-channel intensity factor in [0.8, 1.2] (scanner / site differences) |
+| `aug_gamma` | 0.4 | Per-channel gamma in [1/1.4, 1.4] (contrast between tissues) |
+| `context_slices` | 1 | Neighbouring slices on each side as extra input channels (2.5D); 0 = plain 2D |
 | `compile` | default | `torch.compile` mode, or `none` for eager PyTorch |
 
 ---
@@ -246,8 +267,8 @@ All training hyperparameters are saved to `./tb_logs/config.json` at the start o
 ├── tests/                # pytest unit tests (metrics, preprocessing, splits, aggregation, figures, backends, export)
 ├── dataset.py            # MRISegmentationDataset (slice-level PyTorch Dataset)
 ├── network.py            # UNetModel, ResUNetModel, SwinUNETRModel and ModelFactory
-├── losses.py             # SoftDiceLoss
-├── augmentations.py      # Random scale / rotation / flip pipeline
+├── losses.py             # SoftDiceLoss, DiceBCELoss
+├── augmentations.py      # Random scale / rotation / flip / brightness / gamma pipeline
 ├── utils.py              # Preprocessing, Dice metric, visualization helpers
 ├── tb_logger.py          # TensorBoard wrapper
 ├── fix_model.py          # Strip torch.compile prefix from checkpoints
@@ -263,11 +284,13 @@ All training hyperparameters are saved to `./tb_logs/config.json` at the start o
 
 ## Loss function
 
-Training uses **Soft Dice Loss** computed per-sample and per-channel:
+Training uses **Soft Dice Loss plus binary cross-entropy** on the same logits (as in nnU-Net). The Dice term is computed per-sample and per-channel:
 
-$$\mathcal{L} = 1 - \frac{1}{N} \sum_{i=1}^{N} \frac{2 \sum p_i \cdot g_i + \epsilon}{\sum p_i + \sum g_i + \epsilon}$$
+$$\mathcal{L}_{Dice} = 1 - \frac{1}{N} \sum_{i=1}^{N} \frac{2 \sum p_i \cdot g_i + \epsilon}{\sum p_i + \sum g_i + \epsilon}$$
 
-where $p_i$ are predicted probabilities and $g_i$ are binary ground-truth labels. Laplace smoothing $\epsilon = 1$ prevents division by zero and stabilises gradients on empty slices — most brain slices contain no tumour at all, so this matters in practice.
+where $p_i$ are predicted probabilities and $g_i$ are binary ground-truth labels. Laplace smoothing $\epsilon = 1$ prevents division by zero on empty slices — most brain slices contain no tumour at all.
+
+On a tumour-free slice the Dice term is $1 - 1/(\sum p_i + 1)$. Its gradient vanishes once a false-positive blob is predicted, so Dice alone cannot remove such blobs. The BCE term gives every wrong pixel a gradient, so the total loss is $\mathcal{L} = \mathcal{L}_{Dice} + \mathcal{L}_{BCE}$. The networks therefore return logits; the sigmoid is applied in the loss and at inference, and exported ONNX / TensorRT models include it.
 
 ---
 

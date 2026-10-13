@@ -13,7 +13,8 @@ HAS_ONNX = all(importlib.util.find_spec(name) is not None for name in ("onnx", "
 
 def _benchmark(export_dir: Path) -> ModelBenchmark:
     return ModelBenchmark(torch.device("cpu"), image_size=64, warmup_iters=1, timed_iters=2, use_amp=True,
-                          compile_mode="none", export_dir=str(export_dir), allow_tf32=True)
+                          compile_mode="none", export_dir=str(export_dir), allow_tf32=True,
+                          context_slices=1)
 
 
 def test_pytorch_backend_result_layout(tmp_path: Path) -> None:
