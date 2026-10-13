@@ -7,7 +7,8 @@ set -euo pipefail
 
 ARCHS=${ARCHS:-"unet resunet swinunetr"}
 FOLDS=${FOLDS:-"0 1 2 3 4"}
-SEEDS=${SEEDS:-"0"}
+SEEDS=${SEEDS:-"0 1 2"}
+CONTEXT_SLICES=${CONTEXT_SLICES:-1}  # must match the value the models were trained with (run_cv.sh)
 VARIANTS=${VARIANTS:-"compile fp32.onnx fp16.onnx fp32.engine fp16.engine"}  # "compile" = model.pt + torch.compile
 DATA_DIR=${DATA_DIR:-./kaggle_3m}
 RUNS_DIR=${RUNS_DIR:-./runs}
@@ -34,6 +35,7 @@ for variant in $VARIANTS; do
 
         echo "[$variant] $run"
         python predict.py --arch "$arch" --fold "$fold" --seed "$seed" --split test --data-dir "$DATA_DIR" \
+          --context-slices "$CONTEXT_SLICES" \
           "${model_args[@]}" --results-json "$results" --figure-path "$run/dice_distribution.$variant.png" \
           --output-dir "$run/predictions" --skip-overlays
       done

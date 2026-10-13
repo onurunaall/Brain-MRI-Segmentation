@@ -79,8 +79,24 @@ def test_checkpoint_saved_from_compiled_model_loads(tmp_path: Path) -> None:
     backend = create_backend(str(path), "unet", CPU)
     images = torch.randn(1, 3, 32, 32)
     with torch.no_grad():
-        expected = model(images)
+        expected = torch.sigmoid(model(images))  # the model returns logits, the backend probabilities
     assert torch.allclose(backend.predict(images), expected)
+
+
+def test_context_checkpoint_needs_matching_context_slices(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    model = ModelFactory.create("unet", 9, 1).eval()  # 2.5D: the slice and one neighbour on each side
+    path = tmp_path / "best_model.pt"
+    torch.save(model.state_dict(), path)
+
+    backend = create_backend(str(path), "unet", CPU, context_slices=1)
+    images = torch.randn(1, 9, 32, 32)
+    with torch.no_grad():
+        expected = torch.sigmoid(model(images))
+    assert torch.allclose(backend.predict(images), expected)
+
+    with pytest.raises(RuntimeError, match="--context-slices 0"):
+        create_backend(str(path), "unet", CPU, context_slices=0)
 
 
 def test_unknown_model_file_type_raises(tmp_path: Path) -> None:

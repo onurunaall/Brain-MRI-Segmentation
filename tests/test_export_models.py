@@ -8,7 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-from typing import List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import pytest
 import torch
@@ -24,22 +24,26 @@ HAS_TENSORRT = importlib.util.find_spec("tensorrt") is not None and torch.cuda.i
 needs_onnx = pytest.mark.skipif(not HAS_ONNX, reason="needs onnx, onnxscript and onnxruntime (uv sync --group onnx)")
 
 
-def _model(arch: str, seed: int) -> nn.Module:
+def _model(arch: str, seed: int, in_channels: int = 3) -> nn.Module:
     torch.manual_seed(seed)
-    return ModelFactory.create(arch, 3, 1).eval()
+    return ModelFactory.create(arch, in_channels, 1).eval()
 
 
-def _write_trained_run(runs_dir: Path, arch: str, fold: int, seed: int, model: nn.Module, image_size: int) -> None:
-    """A finished run in the layout run_cv.sh produces (checkpoint, config, train summary, test results)."""
+def _write_trained_run(runs_dir: Path, arch: str, fold: int, seed: int, model: nn.Module, image_size: int,
+                       config: Optional[Dict[str, Any]] = None, meta: Optional[Dict[str, Any]] = None) -> None:
+    """
+    A finished run in the layout run_cv.sh produces (checkpoint, config, train summary, test results).
+    Without `config` / `meta` extras it looks like a run from before 2.5D input and automatic post-processing.
+    """
     run_dir = runs_dir / arch / f"fold{fold}_seed{seed}"
     (run_dir / "checkpoints").mkdir(parents=True)
     (run_dir / "logs").mkdir()
     torch.save(model.state_dict(), run_dir / "checkpoints" / "best_model.pt")
-    (run_dir / "logs" / "config.json").write_text(json.dumps({"image_size": image_size}))
+    (run_dir / "logs" / "config.json").write_text(json.dumps({"image_size": image_size, **(config or {})}))
     (run_dir / "logs" / "train_summary.json").write_text(json.dumps(
         {"fold": fold, "seed": seed, "best_val_dice": 0.8 + fold / 100, "best_epoch": 10 + fold}))
     (run_dir / "test_results.json").write_text(json.dumps(
-        {"meta": {"arch": arch, "fold": fold, "seed": seed},
+        {"meta": {"arch": arch, "fold": fold, "seed": seed, **(meta or {})},
          "per_patient": {"A": {"dice": 0.5}, "B": {"dice": 0.7}}}))
 
 
@@ -59,13 +63,13 @@ def _export_args(runs_dir: Path,
 def test_fp32_onnx_matches_pytorch_for_any_batch_size(tmp_path: Path, arch: str, image_size: int) -> None:
     model = _model(arch, seed=0)
     path = str(tmp_path / "model.fp32.onnx")
-    ModelExporter.export_onnx(model, path, image_size, "fp32")
+    ModelExporter.export_onnx(model, path, image_size, "fp32", 3)
     backend = create_backend(path, arch, CPU)
 
     for batch_size in (1, 3):
         images = torch.randn(batch_size, 3, image_size, image_size)
         with torch.no_grad():
-            expected = model(images)
+            expected = torch.sigmoid(model(images))  # the exported graph ends with the sigmoid
         assert torch.allclose(backend.predict(images), expected, atol=1e-5)
 
 
@@ -73,13 +77,13 @@ def test_fp32_onnx_matches_pytorch_for_any_batch_size(tmp_path: Path, arch: str,
 def test_fp16_onnx_is_close_and_leaves_the_model_in_fp32(tmp_path: Path) -> None:
     model = _model("unet", seed=0)
     path = str(tmp_path / "model.fp16.onnx")
-    ModelExporter.export_onnx(model, path, 64, "fp16")
+    ModelExporter.export_onnx(model, path, 64, "fp16", 3)
 
     assert all(p.dtype == torch.float32 for p in model.parameters())
     backend = create_backend(path, "unet", CPU)
     images = torch.randn(2, 3, 64, 64)
     with torch.no_grad():
-        expected = model(images)
+        expected = torch.sigmoid(model(images))
     probabilities = backend.predict(images)
     assert probabilities.dtype == torch.float32
     assert float((probabilities - expected).abs().max()) < 5e-3
@@ -102,12 +106,42 @@ def test_bundle_manifest_and_ensemble_prediction(tmp_path: Path) -> None:
     assert [m["name"] for m in manifest["members"]] == ["fold0_seed0", "fold1_seed0"]
     assert [m["best_epoch"] for m in manifest["members"]] == [10, 11]
     assert manifest["members"][0]["test_dice_mean"] == pytest.approx(0.6)
+    assert manifest["context_slices"] == 0 and manifest["in_channels"] == 3  # config.json from before 2.5D input
+    assert manifest["members"][0]["postprocess"] is None
 
     ensemble, _ = load_bundle(bundle_dir, "model.pt", CPU)
     images = torch.randn(2, 3, 64, 64)
     with torch.no_grad():
-        expected = (models[0](images) + models[1](images)) / 2
+        expected = (torch.sigmoid(models[0](images)) + torch.sigmoid(models[1](images))) / 2
     assert torch.allclose(ensemble.predict(images), expected, atol=1e-6)
+
+
+def test_context_bundle_records_input_and_postprocess(tmp_path: Path) -> None:
+    models = [_model("unet", seed=fold, in_channels=9) for fold in range(2)]
+    for fold, (model, method) in enumerate(zip(models, ["lcc", "none"])):
+        _write_trained_run(tmp_path / "runs", "unet", fold, 0, model, image_size=64,
+                           config={"context_slices": 1}, meta={"postprocess": method})
+
+    BundleExporter(_export_args(tmp_path / "runs", tmp_path / "models"), CPU).export("unet")
+    bundle_dir = str(tmp_path / "models" / "unet")
+    manifest = read_bundle_manifest(bundle_dir)
+
+    assert manifest["context_slices"] == 1 and manifest["in_channels"] == 9
+    assert [m["postprocess"] for m in manifest["members"]] == ["lcc", "none"]
+
+    ensemble, _ = load_bundle(bundle_dir, "model.pt", CPU)
+    images = torch.randn(2, 9, 64, 64)
+    with torch.no_grad():
+        expected = (torch.sigmoid(models[0](images)) + torch.sigmoid(models[1](images))) / 2
+    assert torch.allclose(ensemble.predict(images), expected, atol=1e-6)
+
+
+def test_runs_with_different_context_slices_are_not_bundled(tmp_path: Path) -> None:
+    _write_trained_run(tmp_path / "runs", "unet", 0, 0, _model("unet", 0), image_size=64)
+    _write_trained_run(tmp_path / "runs", "unet", 1, 0, _model("unet", 1, in_channels=9), image_size=64,
+                       config={"context_slices": 1})
+    with pytest.raises(SystemExit, match="different --context-slices"):
+        BundleExporter(_export_args(tmp_path / "runs", tmp_path / "models"), CPU).export("unet")
 
 
 def test_existing_bundle_is_only_replaced_with_overwrite(tmp_path: Path) -> None:
@@ -175,14 +209,14 @@ def test_tensorrt_engine_matches_pytorch(tmp_path: Path, precision: str, toleran
     model = _model("unet", seed=0).to(device)
     onnx_path = str(tmp_path / f"model.{precision}.onnx")
     engine_path = str(tmp_path / f"model.{precision}.engine")
-    ModelExporter.export_onnx(model, onnx_path, 128, precision)
+    ModelExporter.export_onnx(model, onnx_path, 128, precision, 3)
     ModelExporter.build_tensorrt_engine(onnx_path, engine_path, 128, max_batch=4, opt_batch=4,
                                         allow_tf32=False, workspace_gib=1.0)
     backend = create_backend(engine_path, "unet", device)
 
     images = torch.randn(6, 3, 128, 128, device=device)  # larger than max_batch: predict() splits it
     with torch.no_grad():
-        expected = model(images)
+        expected = torch.sigmoid(model(images))
     probabilities = backend.predict(images)
 
     assert probabilities.shape == expected.shape

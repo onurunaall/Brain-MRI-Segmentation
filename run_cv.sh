@@ -5,8 +5,9 @@ set -euo pipefail
 
 ARCHS=${ARCHS:-"unet resunet swinunetr"}
 FOLDS=${FOLDS:-"0 1 2 3 4"}
-SEEDS=${SEEDS:-"0"}
+SEEDS=${SEEDS:-"0 1 2"}             # several training seeds per fold separate architecture differences from seed noise
 EPOCHS=${EPOCHS:-100}
+CONTEXT_SLICES=${CONTEXT_SLICES:-1} # neighbour slices per side as extra input channels (2.5D); 0 = plain 2D
 DATA_DIR=${DATA_DIR:-./kaggle_3m}
 RUNS_DIR=${RUNS_DIR:-./runs}
 MODELS_DIR=${MODELS_DIR:-./models}
@@ -29,11 +30,13 @@ for arch in $ARCHS; do
       else
         echo "[train] $run"
         python train.py --arch "$arch" --fold "$fold" --seed "$seed" --epochs "$EPOCHS" --compile "$COMPILE" \
+          --context-slices "$CONTEXT_SLICES" \
           --data-dir "$DATA_DIR" --checkpoint-dir "$run/checkpoints" --log-dir "$run/logs"
       fi
 
+      # --postprocess defaults to auto: chosen on this fold's validation patients, never on the test patients
       echo "[test] $run"
-      python predict.py --arch "$arch" --fold "$fold" --seed "$seed" --split test \
+      python predict.py --arch "$arch" --fold "$fold" --seed "$seed" --split test --context-slices "$CONTEXT_SLICES" \
         --data-dir "$DATA_DIR" --model-path "$run/checkpoints/best_model.pt" \
         --results-json "$run/test_results.json" --figure-path "$run/dice_distribution.png" \
         --masks-npz "$run/test_masks.npz" --output-dir "$run/predictions" --skip-overlays

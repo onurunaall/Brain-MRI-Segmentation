@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class SoftDiceLoss(nn.Module):
@@ -47,3 +48,33 @@ class SoftDiceLoss(nn.Module):
 
         # Mean over samples and channels
         return 1.0 - dice_per_sample.mean()
+
+
+class DiceBCELoss(nn.Module):
+    """
+    Soft Dice loss plus binary cross-entropy, both on the same logits (as in nnU-Net).
+
+    Soft Dice alone gives almost no gradient to false positives on a tumour-free slice: there its loss is
+    1 - 1 / (sum(p) + 1), whose gradient 1 / (sum(p) + 1)^2 vanishes once a false blob is predicted. BCE gives
+    every wrong pixel a gradient of size |p - target|, so false blobs on empty slices are pushed down.
+    """
+
+    def __init__(self, smoothing: float = 1.0) -> None:
+        """
+        :param smoothing: Laplace smoothing of the Dice term
+        """
+        super().__init__()
+        self.dice = SoftDiceLoss(smoothing)
+
+    def forward(self,
+                logits: torch.Tensor,
+                target: torch.Tensor) -> torch.Tensor:
+        """
+        :param logits: Raw model outputs (before sigmoid), shape (B, C, H, W)
+        :param target: Ground-truth binary masks, shape (B, C, H, W)
+        :return: Scalar loss tensor (Dice loss + mean BCE)
+        """
+        logits = logits.float()
+        target = target.float()
+        bce = F.binary_cross_entropy_with_logits(logits, target)
+        return self.dice(torch.sigmoid(logits), target) + bce

@@ -32,7 +32,7 @@ class PatientEvaluator:
                              flat_index: List[Tuple[int, int]],
                              patient_ids: List[str]) -> Dict[str, float]:
         """
-        Dice per patient volume after thresholding at 0.5, WITHOUT largest-connected-component filtering.
+        Dice per patient volume after thresholding at 0.5, WITHOUT post-processing (connected-component filtering).
 
         :param preds: Flat list of per-slice probability maps, each (1, H, W)
         :param targets: Flat list of per-slice ground-truth masks, each (1, H, W)
@@ -55,12 +55,12 @@ class PatientEvaluator:
     @staticmethod
     def hd95_per_patient(volumes: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]) -> Dict[str, float]:
         """
-        95th-percentile Hausdorff distance per patient on the LCC-filtered prediction.
+        95th-percentile Hausdorff distance per patient on the post-processed prediction.
 
         Units are voxels of the resized 256x256 grid with slice spacing counted as 1,
         NOT millimetres. Returns 0.0 if both masks are empty and NaN if exactly one is empty.
 
-        :param volumes: Dict patient_id -> (input, LCC prediction, target), as built by predict.py
+        :param volumes: Dict patient_id -> (input, post-processed prediction, target), as built by predict.py
         :return: Dict patient_id -> HD95
         """
         scores: Dict[str, float] = {}
@@ -80,7 +80,7 @@ class PatientEvaluator:
     @staticmethod
     def write_results(path: str,
                       meta: Dict,
-                      dice_lcc: Dict[str, float],
+                      dice_post: Dict[str, float],
                       dice_raw: Dict[str, float],
                       hd95_scores: Dict[str, float]) -> None:
         """
@@ -88,13 +88,13 @@ class PatientEvaluator:
 
         :param path: Output .json path
         :param meta: Run metadata (arch, fold, seed, split, checkpoint)
-        :param dice_lcc: Dice after LCC post-processing (the repo's reported metric)
-        :param dice_raw: Dice without LCC
-        :param hd95_scores: HD95 on LCC prediction (voxel units)
+        :param dice_post: Dice after post-processing (the repo's reported metric)
+        :param dice_raw: Dice without post-processing
+        :param hd95_scores: HD95 on the post-processed prediction (voxel units)
         """
         per_patient = {}
-        for pid in dice_lcc:
-            per_patient[pid] = {"dice": dice_lcc[pid],
+        for pid in dice_post:
+            per_patient[pid] = {"dice": dice_post[pid],
                                 "dice_raw": dice_raw[pid],
                                 "hd95_vox": hd95_scores[pid]}
 

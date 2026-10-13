@@ -39,21 +39,23 @@ class ModelExporter:
     """Exports one trained model to ONNX and builds TensorRT engines from ONNX files."""
 
     @staticmethod
-    def export_onnx(model: nn.Module, onnx_path: str, image_size: int, precision: str) -> None:
+    def export_onnx(model: nn.Module, onnx_path: str, image_size: int, precision: str, in_channels: int) -> None:
         """
         Export with the torch.export-based ONNX exporter and a dynamic batch dimension.
+        The exported graph ends with a sigmoid, so it outputs probabilities (the PyTorch model returns logits).
 
         :param model: Trained model (not modified; an fp16 copy is exported for precision 'fp16')
         :param onnx_path: Output .onnx file (weights embedded, single file)
         :param image_size: Fixed spatial size H = W of the exported graph
         :param precision: 'fp32' or 'fp16' (input, weights and output dtype)
+        :param in_channels: Input channels of the model (SegDataset.num_input_channels(context_slices))
         """
         dtype = torch.float16 if precision == "fp16" else torch.float32
-        export_model = copy.deepcopy(model).eval().to(dtype)
+        export_model = nn.Sequential(copy.deepcopy(model), nn.Sigmoid()).eval().to(dtype)
         device = next(export_model.parameters()).device
 
         # Batch 2, not 1: torch.export specializes dimensions of size 1 to constants
-        example = torch.randn(2, SegDataset.num_input_channels, image_size, image_size, dtype=dtype, device=device)
+        example = torch.randn(2, in_channels, image_size, image_size, dtype=dtype, device=device)
         batch = torch.export.Dim("batch", min=1)
 
         torch.onnx.export(export_model,
@@ -100,7 +102,7 @@ class ModelExporter:
         if not allow_tf32:
             config.clear_flag(trt.BuilderFlag.TF32)
 
-        channels = SegDataset.num_input_channels
+        channels = network.get_input(0).shape[1]  # fixed in the ONNX graph; only the batch dimension is dynamic
         profile = builder.create_optimization_profile()
         profile.set_shape(network.get_input(0).name,
                           (1, channels, image_size, image_size),
@@ -115,20 +117,25 @@ class ModelExporter:
             fp.write(serialized_engine)
 
     @staticmethod
-    def probability_difference(reference: nn.Module, model_path: str, image_size: int, device: torch.device) -> float:
+    def probability_difference(reference: nn.Module,
+                               model_path: str,
+                               image_size: int,
+                               in_channels: int,
+                               device: torch.device) -> float:
         """
         Largest absolute probability difference between an exported model and the fp32 PyTorch model
         on a random batch. A quick sanity check of the export, not an accuracy measurement.
 
-        :param reference: The fp32 PyTorch model that was exported
+        :param reference: The fp32 PyTorch model that was exported (returns logits)
         :param model_path: Exported .onnx or .engine file
         :param image_size: Spatial size the model was exported with
+        :param in_channels: Input channels of the model
         :param device: Device to run both models on
         :return: max |p_exported - p_pytorch| over all pixels
         """
-        images = torch.randn(4, SegDataset.num_input_channels, image_size, image_size, device=device)
+        images = torch.randn(4, in_channels, image_size, image_size, device=device)
         with torch.no_grad():
-            expected = reference(images).float()
+            expected = torch.sigmoid(reference(images).float())
         exported = create_backend(model_path, arch="", device=device)
         return float((exported.predict(images) - expected).abs().max())
 
@@ -159,17 +166,19 @@ class BundleExporter:
             return
 
         image_size = self._common_image_size(run_dirs)
+        context_slices = self._common_context_slices(run_dirs)
         bundle_dir = os.path.join(self.cfg.out_dir, arch)
         if os.path.exists(bundle_dir):
             if not self.cfg.overwrite:
                 raise SystemExit(f"{bundle_dir} exists; pass --overwrite to replace it")
             shutil.rmtree(bundle_dir)
 
-        members = [self._export_member(arch, run_dir, bundle_dir, image_size) for run_dir in run_dirs]
+        members = [self._export_member(arch, run_dir, bundle_dir, image_size, context_slices) for run_dir in run_dirs]
 
         manifest = {"arch": arch,
                     "image_size": image_size,
-                    "in_channels": SegDataset.num_input_channels,
+                    "context_slices": context_slices,
+                    "in_channels": SegDataset.num_input_channels(context_slices),
                     "out_channels": SegDataset.num_output_channels,
                     "files": [CHECKPOINT_NAME] + [f"model.{fmt}" for fmt in self.formats],
                     "members": members,
@@ -178,30 +187,37 @@ class BundleExporter:
             json.dump(manifest, fp, indent=2)
         print(f"[Export] {arch}: {len(members)} members -> {bundle_dir}")
 
-    def _export_member(self, arch: str, run_dir: str, bundle_dir: str, image_size: int) -> Dict[str, Any]:
+    def _export_member(self,
+                       arch: str,
+                       run_dir: str,
+                       bundle_dir: str,
+                       image_size: int,
+                       context_slices: int) -> Dict[str, Any]:
         """Copy one run's checkpoint into the bundle and write its exports. Returns its manifest entry."""
         name = os.path.basename(run_dir)
         member_dir = os.path.join(bundle_dir, name)
         os.makedirs(member_dir)
 
-        model = load_trained_model(arch, os.path.join(run_dir, "checkpoints", "best_model.pt"), self.device)
+        model = load_trained_model(arch, os.path.join(run_dir, "checkpoints", "best_model.pt"), self.device,
+                                   context_slices)
         torch.save(model.state_dict(), os.path.join(member_dir, CHECKPOINT_NAME))
 
+        in_channels = SegDataset.num_input_channels(context_slices)
         for fmt in self.formats:
             path = os.path.join(member_dir, f"model.{fmt}")
-            self._write_format(model, fmt, path, image_size)
+            self._write_format(model, fmt, path, image_size, in_channels)
             if self._can_run(fmt):
-                difference = ModelExporter.probability_difference(model, path, image_size, self.device)
+                difference = ModelExporter.probability_difference(model, path, image_size, in_channels, self.device)
                 print(f"[Export] {arch}/{name}/model.{fmt}: max |probability difference| vs PyTorch fp32 "
                       f"on a random batch = {difference:.2e}")
 
         return {"name": name, **self._run_info(run_dir)}
 
-    def _write_format(self, model: nn.Module, fmt: str, path: str, image_size: int) -> None:
+    def _write_format(self, model: nn.Module, fmt: str, path: str, image_size: int, in_channels: int) -> None:
         """Write model.<fmt>; an engine is built from the ONNX file of the same precision next to it."""
         precision, kind = fmt.split(".")
         if kind == "onnx":
-            ModelExporter.export_onnx(model, path, image_size, precision)
+            ModelExporter.export_onnx(model, path, image_size, precision, in_channels)
             return
 
         onnx_path = os.path.join(os.path.dirname(path), f"model.{precision}.onnx")
@@ -239,21 +255,38 @@ class BundleExporter:
             raise SystemExit(f"Runs were trained with different image sizes {sorted(sizes)}; bundle them separately")
         return int(sizes.pop())
 
+    def _common_context_slices(self, run_dirs: List[str]) -> int:
+        """Neighbour slices per side the runs were trained with; runs from before 2.5D input have 0."""
+        values = set()
+        for run_dir in run_dirs:
+            config = self._read_json(os.path.join(run_dir, "logs", "config.json")) or {}
+            values.add(config.get("context_slices", 0))
+        if len(values) != 1:
+            raise SystemExit(f"Runs were trained with different --context-slices {sorted(values)}; "
+                             f"bundle them separately")
+        return int(values.pop())
+
     def _run_info(self, run_dir: str) -> Dict[str, Any]:
-        """Provenance of one member: its fold, seed, validation score and held-out test score."""
+        """
+        Provenance of one member: its fold, seed, validation score, held-out test score and the post-processing
+        predict.py chose for it on its validation patients (pass the most common one with --split all).
+        """
         summary = self._read_json(os.path.join(run_dir, "logs", "train_summary.json")) or {}
         test_results = self._read_json(os.path.join(run_dir, "test_results.json"))
 
         test_dice_mean: Optional[float] = None
+        postprocess: Optional[str] = None
         if test_results:
             dice_values = [values["dice"] for values in test_results["per_patient"].values()]
             test_dice_mean = sum(dice_values) / len(dice_values)
+            postprocess = test_results["meta"].get("postprocess")
 
         return {"fold": summary.get("fold"),
                 "seed": summary.get("seed"),
                 "best_val_dice": summary.get("best_val_dice"),
                 "best_epoch": summary.get("best_epoch"),
                 "test_dice_mean": test_dice_mean,
+                "postprocess": postprocess,
                 "source_run": os.path.abspath(run_dir)}
 
     def _versions(self) -> Dict[str, Optional[str]]:
