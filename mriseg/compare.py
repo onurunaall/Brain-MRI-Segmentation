@@ -1,8 +1,8 @@
 """
 Comparison figures across architectures from finished CV runs (no GPU, no dataset needed).
-Usage: python compare.py --runs-dir ./runs --baseline unet
+Usage: python -m mriseg.compare --runs-dir ./runs --baseline unet
 Expects per run: <runs-dir>/<arch>/fold<k>_seed<s>/test_results.json, test_masks.npz (predict.py --masks-npz)
-and logs/history.csv (train.py). Runs without history.csv fall back to their TensorBoard event file.
+and logs/history.csv (train.py).
 Writes figures to <runs-dir>/figures/ (or --out-dir), with one gallery folder per architecture.
 """
 
@@ -23,6 +23,8 @@ from matplotlib.patches import Patch
 from matplotlib.ticker import MaxNLocator
 import numpy as np
 
+from mriseg.aggregate import HD95_KEY, mean_per_patient
+
 # Overlay colours (RGB 0-1): true positive, false positive, false negative, ground truth
 TP_COLOR = (0.0, 0.8, 0.0)
 FP_COLOR = (1.0, 0.1, 0.1)
@@ -34,8 +36,8 @@ GALLERY_COLUMNS = 10
 PROBABILITY_CMAP = "magma"
 GT_OUTLINE_COLOR = "cyan"
 
-# (patient id, mean Dice over architectures, FLAIR, ground truth, prediction per arch, shown slice)
-OverviewEntry = Tuple[str, float, np.ndarray, np.ndarray, Dict[str, np.ndarray], int]
+# (patient id, mean Dice over architectures, FLAIR, ground truth, prediction per arch, Dice per arch, shown slice)
+OverviewEntry = Tuple[str, float, np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[str, float], int]
 
 
 @dataclass
@@ -64,7 +66,6 @@ class RunRecord:
         self.seed: int = meta.get("seed", 0)
         self.masks_path = os.path.join(run_dir, "test_masks.npz")
         self.history_path = os.path.join(run_dir, "logs", "history.csv")
-        self.log_dir = os.path.join(run_dir, "logs")
 
     def per_patient(self, metric: str) -> Dict[str, float]:
         return {pid: vals[metric] for pid, vals in self.results["per_patient"].items()}
@@ -94,13 +95,7 @@ class ComparisonPlotter:
 
     def _per_patient(self, arch: str, metric: str) -> Dict[str, float]:
         """Metric per patient averaged over seeds (each patient is tested in exactly one fold)."""
-        collected: Dict[str, List[float]] = {}
-        for run in self.runs:
-            if run.arch == arch:
-                for pid, value in run.per_patient(metric).items():
-                    collected.setdefault(pid, []).append(value)
-        return {pid: float(np.nanmean(v)) if not np.all(np.isnan(v)) else float("nan")
-                for pid, v in collected.items()}
+        return mean_per_patient((run.results for run in self.runs if run.arch == arch), metric)
 
     def _mask_run(self, arch: str, fold: Optional[int]) -> Optional[RunRecord]:
         """Run whose masks represent (arch, fold): the requested seed, else the lowest available seed."""
@@ -116,15 +111,16 @@ class ComparisonPlotter:
         """Box + individual points of per-patient Dice and HD95 for every architecture."""
         fig, axes = plt.subplots(1, 2, figsize=(6 + 2.5 * len(self.archs), 5))
         specs = [("dice", "Dice per patient (post-processed)", axes[0]),
-                 ("hd95_vox", "HD95 per patient (voxels, lower = better)", axes[1])]
+                 (HD95_KEY, "HD95 per patient (original-image pixels, lower = better)", axes[1])]
         rng = np.random.default_rng(0)
 
         for metric, title, ax in specs:
             data, n_nan = [], []
             for arch in self.archs:
+                # Undefined HD95 (tumour missed in some run) is infinite; it is counted in the label, not drawn
                 values = np.array(list(self._per_patient(arch, metric).values()), dtype=float)
-                n_nan.append(int(np.isnan(values).sum()))
-                data.append(values[~np.isnan(values)])
+                n_nan.append(int((~np.isfinite(values)).sum()))
+                data.append(values[np.isfinite(values)])
 
             ax.boxplot(data, showfliers=False, widths=0.5)
             for i, values in enumerate(data, start=1):
@@ -234,59 +230,18 @@ class ComparisonPlotter:
             rows = list(csv.DictReader(fp))
         return {key: np.array([float(r[key]) for r in rows]) for key in ("epoch", "train_loss", "val_loss", "val_dice")}
 
-    @staticmethod
-    def _read_history_tensorboard(log_dir: str) -> Optional[Dict[str, np.ndarray]]:
-        """
-        Rebuild per-epoch history from the newest TensorBoard event file (runs trained before history.csv existed).
-        val_loss / val_dice are exact; train_loss is the mean of the 10-step training-loss points in each epoch.
-        """
-        event_files = sorted(glob.glob(os.path.join(log_dir, "events.out.tfevents.*")), key=os.path.getmtime)
-        if not event_files:
-            return None
-        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-
-        acc = EventAccumulator(event_files[-1], size_guidance={"scalars": 0})  # newest = last (re)started run
-        acc.Reload()
-        tags = acc.Tags().get("scalars", [])
-        if "val/dice" not in tags or "val/loss" not in tags:
-            return None
-
-        val_dice = acc.Scalars("val/dice")
-        val_loss = acc.Scalars("val/loss")
-        train_pts = acc.Scalars("train/loss") if "train/loss" in tags else []
-        epoch_ends = [e.step for e in val_dice]
-
-        train_loss, prev_end = [], -1
-        for end in epoch_ends:
-            pts = [e.value for e in train_pts if prev_end < e.step <= end]
-            train_loss.append(np.mean(pts) if pts else np.nan)
-            prev_end = end
-
-        return {"epoch": np.arange(1, len(val_dice) + 1, dtype=float),
-                "train_loss": np.array(train_loss, dtype=float),
-                "val_loss": np.array([e.value for e in val_loss], dtype=float),
-                "val_dice": np.array([e.value for e in val_dice], dtype=float)}
-
     def plot_training_curves(self) -> None:
         """Mean ± std (over folds and seeds) of train loss, val loss and val Dice per epoch."""
         histories: Dict[str, List[Dict[str, np.ndarray]]] = {}
-        n_fallback = 0
         for run in self.runs:
-            hist: Optional[Dict[str, np.ndarray]]
             if os.path.exists(run.history_path):
                 hist = self._read_history_csv(run.history_path)
-            else:
-                hist = self._read_history_tensorboard(run.log_dir)
-                n_fallback += hist is not None
-            if hist is not None and len(hist["epoch"]):
-                histories.setdefault(run.arch, []).append(hist)
+                if len(hist["epoch"]):
+                    histories.setdefault(run.arch, []).append(hist)
 
         if not histories:
-            print("[Compare] skip training curves: no history.csv or TensorBoard logs found")
+            print("[Compare] skip training curves: no logs/history.csv found")
             return
-        if n_fallback:
-            print(f"[Compare] {n_fallback} run(s) had no history.csv; used TensorBoard "
-                  f"(train loss there is approximate)")
 
         panels = [("train_loss", "Train loss (with augmentation)"),
                   ("val_loss", "Validation loss"),
@@ -379,59 +334,65 @@ class ComparisonPlotter:
             return {key[len(prefix):]: npz[key] for key in npz.files if key.startswith(prefix)}
 
     def _load_fold_masks(self, fold: Optional[int]) -> Tuple[Dict[str, Dict[str, np.ndarray]],
-                                                             Dict[str, Dict[str, np.ndarray]]]:
-        """FLAIR+GT per patient (from the first architecture that has them) and predictions per arch for one fold."""
+                                                             Dict[str, Dict[str, np.ndarray]],
+                                                             Dict[str, Dict[str, float]]]:
+        """
+        For one fold: FLAIR+GT per patient (from the first architecture that has them), predictions per arch, and
+        the patient Dice of the same runs whose predictions are drawn (one seed, see _mask_run).
+        """
         flair_gt: Dict[str, Dict[str, np.ndarray]] = {}
         preds: Dict[str, Dict[str, np.ndarray]] = {}
+        dice: Dict[str, Dict[str, float]] = {}
         for arch in self.archs:
             run = self._mask_run(arch, fold)
             if run is None:
                 continue
+            run_dice = run.per_patient("dice")
             for pid, arrays in self._read_masks(run.masks_path).items():
                 if "pred" in arrays:
                     preds.setdefault(pid, {})[arch] = arrays["pred"]
+                    dice.setdefault(pid, {})[arch] = run_dice.get(pid, float("nan"))
                 for kind in ("flair", "gt"):
                     if kind in arrays:
                         flair_gt.setdefault(pid, {}).setdefault(kind, arrays[kind])
-        return flair_gt, preds
+        return flair_gt, preds, dice
 
     def plot_segmentation_grids(self, max_patients: Optional[int]) -> None:
         """One figure per test patient: rows = picked slices, columns = FLAIR | GT | each architecture."""
         seg_dir = os.path.join(self.out_dir, "segmentation")
         os.makedirs(seg_dir, exist_ok=True)
-        dice_by_arch = {arch: self._per_patient(arch, "dice") for arch in self.archs}
         overview: List[OverviewEntry] = []
         n_written = 0
 
         for fold in sorted({r.fold for r in self.runs}, key=lambda f: (f is None, f)):
-            flair_gt, preds = self._load_fold_masks(fold)
+            flair_gt, preds, dice = self._load_fold_masks(fold)
             for pid in sorted(flair_gt):
                 if max_patients is not None and n_written >= max_patients:
                     break
                 flair, gt = flair_gt[pid]["flair"], flair_gt[pid]["gt"]
                 arch_preds = preds.get(pid, {})
+                arch_dice = dice.get(pid, {})
                 if any(p.shape != gt.shape for p in arch_preds.values()):
                     print(f"[Compare] skip {pid}: mask shapes differ between architectures (different --image-size?)")
                     continue
                 archs = [a for a in self.archs if a in arch_preds]
                 picks = self._pick_slices(gt, [arch_preds[a] for a in archs])
-                self._draw_patient(pid, fold, flair, gt, arch_preds, archs, picks, dice_by_arch,
+                self._draw_patient(pid, fold, flair, gt, arch_preds, archs, picks, arch_dice,
                                    os.path.join(seg_dir, f"{pid}.png"))
                 n_written += 1
 
-                mean_dice = np.nanmean([dice_by_arch[a].get(pid, np.nan) for a in archs]) if archs else np.nan
-                overview.append((pid, float(mean_dice), flair, gt, arch_preds, picks[0][0]))
+                mean_dice = np.nanmean([arch_dice[a] for a in archs]) if archs else np.nan
+                overview.append((pid, float(mean_dice), flair, gt, arch_preds, arch_dice, picks[0][0]))
 
         if n_written == 0:
-            print("[Compare] skip segmentation grids: no test_masks.npz found "
-                  "(re-run predict.py with --masks-npz, or re-run run_cv.sh which back-fills them)")
+            print("[Compare] skip segmentation grids: no test_masks.npz found (re-run predict.py with --masks-npz)")
             return
         print(f"[Compare] wrote {n_written} per-patient segmentation figures -> {seg_dir}")
-        self._draw_overview(overview, dice_by_arch)
+        self._draw_overview(overview)
 
     def _draw_patient(self, pid: str, fold: Optional[int], flair: np.ndarray, gt: np.ndarray,
                       arch_preds: Dict[str, np.ndarray], archs: List[str], picks: List[Tuple[int, str]],
-                      dice_by_arch: Dict[str, Dict[str, float]], path: str) -> None:
+                      arch_dice: Dict[str, float], path: str) -> None:
         n_cols = 2 + len(archs)
         fig, axes = plt.subplots(len(picks), n_cols, figsize=(2.6 * n_cols, 2.8 * len(picks) + 0.8), squeeze=False)
 
@@ -452,18 +413,15 @@ class ComparisonPlotter:
                     ax.set_title(title, fontsize=8)
             axes[row, 0].set_ylabel(f"slice {s}\n({why})", fontsize=8)
 
-        patient_scores = ", ".join(f"{a} {dice_by_arch[a].get(pid, float('nan')):.3f}" for a in archs)
+        patient_scores = ", ".join(f"{a} {arch_dice[a]:.3f}" for a in archs)
         fold_txt = f"fold {fold}" if fold is not None else "no fold"
-        fig.suptitle(f"{pid} ({fold_txt}) | patient Dice: {patient_scores}", fontsize=10)
+        fig.suptitle(f"{pid} ({fold_txt}) | patient Dice of the runs shown: {patient_scores}", fontsize=10)
         fig.legend(handles=_legend_handles(), loc="lower center", ncol=4, fontsize=8, frameon=False)
         fig.tight_layout(rect=(0, 0.04, 1, 0.97))
         fig.savefig(path, dpi=110)
         plt.close(fig)
 
-    def _draw_overview(self,
-                       overview: List[OverviewEntry],
-                       dice_by_arch: Dict[str, Dict[str, float]],
-                       n_each: int = 2) -> None:
+    def _draw_overview(self, overview: List[OverviewEntry], n_each: int = 2) -> None:
         """Best / median / worst patients (by mean Dice over architectures) on their largest-tumour slice."""
         ranked = sorted([o for o in overview if not np.isnan(o[1])], key=lambda o: o[1])
         if not ranked:
@@ -480,13 +438,13 @@ class ComparisonPlotter:
 
         n_cols = 2 + len(self.archs)
         fig, axes = plt.subplots(len(rows), n_cols, figsize=(2.6 * n_cols, 2.7 * len(rows) + 0.8), squeeze=False)
-        for r, (label, (pid, mean_dice, flair, gt, arch_preds, s)) in enumerate(rows):
+        for r, (label, (pid, mean_dice, flair, gt, arch_preds, arch_dice, s)) in enumerate(rows):
             panels: List[Tuple[str, Optional[np.ndarray]]] = [
                 ("FLAIR", self._overlay(flair[s], np.zeros_like(gt[s]), None)),
                 ("Ground truth", self._overlay(flair[s], gt[s], None))]
             for arch in self.archs:
                 if arch in arch_preds:
-                    panels.append((f"{arch}: {dice_by_arch[arch].get(pid, float('nan')):.3f}",
+                    panels.append((f"{arch}: {arch_dice[arch]:.3f}",
                                    self._overlay(flair[s], gt[s], arch_preds[arch][s])))
                 else:
                     panels.append((f"{arch}: no masks", None))
@@ -647,29 +605,29 @@ class ComparisonPlotter:
         plt.close(fig)
         print(f"[Compare] wrote {path}")
 
-    @classmethod
-    def cli(cls) -> None:
-        parser = argparse.ArgumentParser(description="Comparison figures across architectures")
-        parser.add_argument("--runs-dir", type=str, default="./runs")
-        parser.add_argument("--out-dir", type=str, default=None, help="Default: <runs-dir>/figures")
-        parser.add_argument("--baseline", type=str, default="unet")
-        parser.add_argument("--seed", type=int, default=None,
-                            help="Training seed whose masks are drawn (default: lowest available per arch/fold)")
-        parser.add_argument("--max-patients", type=int, default=None,
-                            help="Limit the number of per-patient segmentation figures (default: all)")
-        parser.add_argument("--gallery-cases", type=int, default=3,
-                            help="Worst, median and best patients drawn per architecture gallery (default: 3 each)")
-        args = parser.parse_args()
 
-        plotter = cls(args.runs_dir, args.out_dir or os.path.join(args.runs_dir, "figures"), args.baseline, args.seed)
-        plotter.load()
-        plotter.plot_metric_distributions()
-        plotter.plot_paired_vs_baseline()
-        plotter.plot_fold_means()
-        plotter.plot_dice_vs_volume()
-        plotter.plot_training_curves()
-        plotter.plot_segmentation_grids(args.max_patients)
-        plotter.plot_architecture_galleries(args.gallery_cases)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Comparison figures across architectures")
+    parser.add_argument("--runs-dir", type=str, default="./runs")
+    parser.add_argument("--out-dir", type=str, default=None, help="Default: <runs-dir>/figures")
+    parser.add_argument("--baseline", type=str, default="unet")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Training seed whose masks are drawn (default: lowest available per arch/fold)")
+    parser.add_argument("--max-patients", type=int, default=None,
+                        help="Limit the number of per-patient segmentation figures (default: all)")
+    parser.add_argument("--gallery-cases", type=int, default=3,
+                        help="Worst, median and best patients drawn per architecture gallery (default: 3 each)")
+    args = parser.parse_args()
+
+    plotter = ComparisonPlotter(args.runs_dir, args.out_dir or os.path.join(args.runs_dir, "figures"), args.baseline, args.seed)
+    plotter.load()
+    plotter.plot_metric_distributions()
+    plotter.plot_paired_vs_baseline()
+    plotter.plot_fold_means()
+    plotter.plot_dice_vs_volume()
+    plotter.plot_training_curves()
+    plotter.plot_segmentation_grids(args.max_patients)
+    plotter.plot_architecture_galleries(args.gallery_cases)
 
 
 def _legend_handles() -> List[Patch]:
@@ -680,4 +638,4 @@ def _legend_handles() -> List[Patch]:
 
 
 if __name__ == "__main__":
-    ComparisonPlotter.cli()
+    main()

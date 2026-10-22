@@ -3,8 +3,9 @@
 import numpy as np
 import pytest
 
-from utils import (crop_to_content, dice_similarity_coefficient, draw_contour, grayscale_to_rgb,
-                   normalize_intensity, pad_to_square, postprocess_mask, resize_volume)
+from mriseg.utils import (VolumeGeometry, content_box, dice_similarity_coefficient, draw_contour, grayscale_to_rgb,
+                          group_slices_by_patient, normalize_intensity, pad_to_square, postprocess_mask,
+                          resize_volume, restore_mask_geometry)
 
 
 # ------------------------------------------------------------------ Dice
@@ -50,23 +51,19 @@ class TestDiceSimilarityCoefficient:
         assert dice_similarity_coefficient(pred, gt) == pytest.approx(0.0, abs=1e-6)
         assert dice_similarity_coefficient(pred, np.zeros_like(gt)) == 1.0
 
-    def test_lcc_removes_stray_component(self) -> None:
+    def test_keeps_stray_components(self) -> None:
+        """Dice does no post-processing of its own (postprocess_mask does that)."""
         gt = np.zeros((3, 10, 10), dtype=np.float32)
         gt[1, 2:6, 2:6] = 1
         pred = gt * 0.9
         pred[2, 9, 9] = 0.9  # isolated false-positive voxel, not connected to the tumour
+        assert dice_similarity_coefficient(pred, gt) == pytest.approx(2 * 16 / (17 + 16))
 
-        with_lcc = dice_similarity_coefficient(pred, gt, apply_lcc=True)
-        without_lcc = dice_similarity_coefficient(np.round(pred), gt, apply_lcc=False)
-
-        assert with_lcc == pytest.approx(1.0)
-        assert without_lcc == pytest.approx(2 * 16 / (17 + 16))
-
-    def test_lcc_thresholds_probabilities_at_half(self) -> None:
+    def test_thresholds_probabilities_at_half(self) -> None:
         gt = np.zeros((1, 6, 6), dtype=np.float32)
         gt[0, 1:4, 1:4] = 1
-        pred = gt * 0.6  # every tumour voxel just above threshold
-        assert dice_similarity_coefficient(pred, gt) == pytest.approx(1.0)
+        assert dice_similarity_coefficient(gt * 0.6, gt) == pytest.approx(1.0)  # just above the threshold
+        assert dice_similarity_coefficient(gt * 0.5, gt) == pytest.approx(0.0, abs=1e-6)  # 0.5 is background
 
 
 # ------------------------------------------------------- post-processing
@@ -114,28 +111,77 @@ class TestPostprocessMask:
             postprocess_mask(np.zeros((1, 2, 2)), "largest")
 
 
+# ---------------------------------------------------------- slice grouping
+
+class TestGroupSlicesByPatient:
+
+    def test_stacks_each_patients_slices(self) -> None:
+        slices = [np.full((1, 2, 2), value, dtype=np.float32) for value in range(5)]
+        volumes = group_slices_by_patient(slices, [(0, 0), (0, 1), (1, 0), (1, 1), (1, 2)], ["A", "B"])
+        assert list(volumes) == ["A", "B"]
+        assert volumes["A"].shape == (2, 1, 2, 2)
+        np.testing.assert_array_equal(volumes["B"][:, 0, 0, 0], [2, 3, 4])
+
+    def test_rejects_missing_or_reordered_slices(self) -> None:
+        slices = [np.zeros((1, 2, 2))] * 2
+        with pytest.raises(ValueError, match="Got 2 slices for a dataset of 3"):
+            group_slices_by_patient(slices, [(0, 0), (0, 1), (0, 2)], ["A"])
+        with pytest.raises(ValueError, match="out of order"):
+            group_slices_by_patient(slices, [(0, 0), (0, 2)], ["A"])
+
+
 # --------------------------------------------------------- preprocessing
 
-class TestCropToContent:
+class TestContentBox:
 
-    def test_crops_to_bounding_box_of_foreground(self) -> None:
+    def test_box_is_the_bounding_box_of_the_foreground(self) -> None:
         vol = np.zeros((6, 20, 30, 3), dtype=np.float32)
         vol[1:4, 5:12, 7:20, :] = 100.0
         seg = np.zeros((6, 20, 30), dtype=np.float32)
         seg[2, 6:8, 8:10] = 1
 
-        vol_c, seg_c = crop_to_content((vol, seg))
+        box = content_box(vol)
 
-        assert vol_c.shape == (3, 7, 13, 3)
-        assert seg_c.shape == (3, 7, 13)
-        assert seg_c.sum() == seg.sum()  # tumour lies inside the brain box, nothing lost
+        assert box == (slice(1, 4), slice(5, 12), slice(7, 20))
+        assert seg[box].sum() == seg.sum()  # tumour lies inside the brain box, nothing lost
 
     def test_ignores_voxels_below_background_threshold(self) -> None:
         vol = np.zeros((2, 10, 10, 1), dtype=np.float32)
         vol[:, 2:8, 2:8] = 100.0
         vol[:, 0, 0] = 5.0  # 5% of max, below the default 10% threshold
-        vol_c, _ = crop_to_content((vol, np.zeros((2, 10, 10))))
-        assert vol_c.shape == (2, 6, 6, 1)
+        assert vol[content_box(vol)].shape == (2, 6, 6, 1)
+
+
+class TestRestoreMaskGeometry:
+
+    @staticmethod
+    def _preprocess(height: int, width: int, grid_size: int) -> tuple:
+        """A 9-slice scan whose content box is 5 slices x height x width; returns (original mask, grid mask, geometry)."""
+        vol = np.zeros((9, 40, 40, 3), dtype=np.float32)
+        vol[2:7, 5:5 + height, 8:8 + width] = 100.0
+        mask = np.zeros((9, 40, 40), dtype=np.float32)
+        mask[3:5, 10:16, 12:15] = 1
+
+        inner_vol, inner_mask = vol[1:-1], mask[1:-1]  # the dataset drops the first and last slice
+        z, y, x = box = content_box(inner_vol)
+        geometry = VolumeGeometry(n_slices=9, height=40, width=40, z_start=z.start + 1, y_start=y.start,
+                                  x_start=x.start, crop_slices=z.stop - z.start, crop_height=y.stop - y.start,
+                                  crop_width=x.stop - x.start, grid_size=grid_size)
+        _, grid_mask = resize_volume(pad_to_square((inner_vol[box], inner_mask[box])), target_size=grid_size)
+        return mask, grid_mask, geometry
+
+    def test_round_trip_is_exact_without_resizing(self) -> None:
+        mask, grid_mask, geometry = self._preprocess(height=20, width=14, grid_size=20)  # padded to 20 = grid
+        restored = restore_mask_geometry(grid_mask, geometry)
+        assert restored.shape == (9, 40, 40)
+        np.testing.assert_array_equal(restored, mask > 0.5)
+
+    @pytest.mark.parametrize("height, width, grid_size", [(20, 14, 64), (31, 27, 40), (17, 23, 256)])
+    def test_round_trip_is_exact_after_resizing(self, height: int, width: int, grid_size: int) -> None:
+        # A perfect prediction on the grid must come back on exactly the original pixels: not shifted, none lost
+        mask, grid_mask, geometry = self._preprocess(height=height, width=width, grid_size=grid_size)
+        restored = restore_mask_geometry(grid_mask, geometry)
+        np.testing.assert_array_equal(restored, mask > 0.5)
 
 
 class TestPadToSquare:
@@ -182,6 +228,18 @@ class TestResizeVolume:
         assert set(np.unique(seg_r)) <= {0.0, 1.0}
         assert seg_r.sum() > 0
 
+    def test_mask_stays_on_the_image(self) -> None:
+        # The same square drawn into the image and the mask must land on the same grid pixels after resizing
+        seg = np.zeros((1, 21, 21), dtype=np.float32)
+        seg[0, 5:12, 7:15] = 1
+        vol = np.repeat(seg[..., None], 3, axis=-1) * 100.0
+        vol_r, seg_r = resize_volume((vol, seg), target_size=64)
+
+        image_rows, image_cols = np.nonzero(vol_r[0, ..., 0] > 50)
+        mask_rows, mask_cols = np.nonzero(seg_r[0])
+        assert abs(image_rows.mean() - mask_rows.mean()) < 0.3
+        assert abs(image_cols.mean() - mask_cols.mean()) < 0.3
+
     def test_volume_clamped_to_original_range(self) -> None:
         # Bicubic interpolation overshoots at sharp edges; resize_volume clamps it back
         vol = np.zeros((1, 10, 10, 1), dtype=np.float32)
@@ -193,16 +251,29 @@ class TestResizeVolume:
 
 class TestNormalizeIntensity:
 
-    def test_each_channel_zero_mean_unit_std(self) -> None:
+    @staticmethod
+    def _scan(n_background: int) -> np.ndarray:
+        """The same 5000 head voxels (3 channels, each its own distribution) after n_background black voxels."""
         rng = np.random.default_rng(0)
-        vol = np.stack([rng.normal(100, 20, (4, 16, 16)),
-                        rng.uniform(0, 1000, (4, 16, 16)),
-                        rng.exponential(5, (4, 16, 16))], axis=-1)
+        head = np.stack([rng.normal(100, 20, 5000).clip(30),
+                         rng.uniform(200, 1000, 5000),
+                         rng.exponential(50, 5000) + 30], axis=-1)
+        return np.concatenate([np.zeros((n_background, 3)), head])[None, None]  # (Z, H, W, C) = (1, 1, N, 3)
 
-        out = normalize_intensity(vol.copy())
+    def test_head_voxels_get_zero_mean_unit_std(self) -> None:
+        out = normalize_intensity(self._scan(n_background=2000))
+        head = out[0, 0, 2000:]
+        np.testing.assert_allclose(head.mean(axis=0), 0.0, atol=1e-4)
+        np.testing.assert_allclose(head.std(axis=0), 1.0, atol=1e-4)
 
-        np.testing.assert_allclose(out.mean(axis=(0, 1, 2)), 0.0, atol=1e-6)
-        np.testing.assert_allclose(out.std(axis=(0, 1, 2)), 1.0, atol=1e-6)
+    def test_result_does_not_depend_on_the_amount_of_background(self) -> None:
+        little = normalize_intensity(self._scan(n_background=500))[0, 0, 500:]
+        much = normalize_intensity(self._scan(n_background=20000))[0, 0, 20000:]
+        np.testing.assert_allclose(little, much, atol=1e-5)
+
+    def test_background_becomes_the_channel_minimum(self) -> None:
+        out = normalize_intensity(self._scan(n_background=100))
+        np.testing.assert_allclose(out[0, 0, 0], out.min(axis=(0, 1, 2)))
 
     def test_constant_channel_gives_no_nan(self) -> None:
         vol = np.random.default_rng(0).random((2, 8, 8, 3))
@@ -242,6 +313,22 @@ class TestDrawContour:
         expected[1:6, 1:6] = True
         expected[2:5, 2:5] = False  # interior pixels have no background neighbour
         assert np.array_equal(coloured, expected)
+
+    def test_matches_the_original_pixel_loop(self) -> None:
+        """The vectorized boundary equals the old per-pixel check: a mask pixel with a background 8-neighbour."""
+        def reference(mask: np.ndarray) -> np.ndarray:
+            binary = np.round(mask)
+            boundary = np.zeros(mask.shape, dtype=bool)
+            for r, c in zip(*np.nonzero(binary)):
+                neighbourhood = binary[max(0, r - 1): r + 2, max(0, c - 1): c + 2]
+                boundary[r, c] = 0.0 < np.mean(neighbourhood) < 1.0
+            return boundary
+
+        rng = np.random.default_rng(0)
+        for _ in range(50):
+            mask = (rng.random((24, 24)) < 0.5).astype(np.float64)  # many components touching the image border
+            out = draw_contour(np.zeros((24, 24, 3), dtype=np.uint8), mask, color=[255, 0, 0])
+            np.testing.assert_array_equal(np.all(out == [255, 0, 0], axis=-1), reference(mask))
 
     def test_empty_mask_leaves_image_unchanged(self) -> None:
         image = np.full((5, 5, 3), 7, dtype=np.uint8)

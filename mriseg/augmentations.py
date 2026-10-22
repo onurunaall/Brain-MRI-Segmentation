@@ -64,8 +64,6 @@ class AugmentationPipeline:
         :param sample: Tuple of (image, mask) numpy arrays, shape (H, W, C)
         :return: Augmented (image, mask) numpy arrays, shape (H, W, C)
         """
-        import numpy as np
-
         image_np, mask_np = sample
 
         # (H, W, C) → (C, H, W) tensor
@@ -106,15 +104,16 @@ class RandomScale:
         new_h = int(round(orig_h * factor))
         new_w = int(round(orig_w * factor))
 
-        # Bilinear for image, nearest for mask
+        # Bilinear for image, nearest for mask. NEAREST_EXACT samples pixel centres like BILINEAR does; plain NEAREST
+        # would shift every training label half a pixel down-right of its image
         image = TF.resize(image,
                           [new_h, new_w],
                           interpolation=TF.InterpolationMode.BILINEAR,
                           antialias=False)
-        
+
         mask = TF.resize(mask,
                          [new_h, new_w],
-                         interpolation=TF.InterpolationMode.NEAREST,
+                         interpolation=TF.InterpolationMode.NEAREST_EXACT,
                          antialias=False)
 
         if factor < 1.0:

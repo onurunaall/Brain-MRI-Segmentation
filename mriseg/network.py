@@ -406,26 +406,21 @@ class SwinUNETRModel(nn.Module):
         return self.head(out)
 
 
-class ModelFactory:
-    """
-    Simple Factory: maps an architecture name to its model class.
-    To add a model, add one entry to _registry. Callers never import model classes directly.
-    """
+# Architecture name -> model class. To add a model, add one entry here; callers use create_model().
+ARCHITECTURES: Dict[str, Type[nn.Module]] = {
+    "unet": UNetModel,
+    "resunet": ResUNetModel,
+    "swinunetr": SwinUNETRModel,
+}
 
-    _registry: Dict[str, Type[nn.Module]] = {
-        "unet": UNetModel,
-        "resunet": ResUNetModel,
-        "swinunetr": SwinUNETRModel,
-    }
 
-    @classmethod
-    def available(cls) -> List[str]:
-        """Sorted list of registered architecture names (use for argparse choices)."""
-        return sorted(cls._registry)
+def available_architectures() -> List[str]:
+    """Sorted list of registered architecture names (use for argparse choices)."""
+    return sorted(ARCHITECTURES)
 
-    @classmethod
-    def create(cls, arch: str, in_channels: int, out_channels: int) -> nn.Module:
-        """Instantiate the named architecture with its default width settings."""
-        if arch not in cls._registry:
-            raise ValueError(f"Unknown arch '{arch}'. Choose from {cls.available()}")
-        return cls._registry[arch](in_channels=in_channels, out_channels=out_channels)
+
+def create_model(arch: str, in_channels: int, out_channels: int) -> nn.Module:
+    """Instantiate the named architecture with its default width settings."""
+    if arch not in ARCHITECTURES:
+        raise ValueError(f"Unknown arch '{arch}'. Choose from {available_architectures()}")
+    return ARCHITECTURES[arch](in_channels=in_channels, out_channels=out_channels)

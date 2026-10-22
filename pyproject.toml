@@ -15,7 +15,6 @@ dependencies = [
     "matplotlib>=3.8.0",
     "tqdm>=4.66.0",
     "kagglehub",
-    "scikit-image",
 ]
 
 [tool.uv]
@@ -32,6 +31,7 @@ tensorrt = ["tensorrt>=11.3,<12"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.mypy]
 python_version = "3.10"

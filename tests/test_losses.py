@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from losses import DiceBCELoss, SoftDiceLoss
+from mriseg.losses import DiceBCELoss, SoftDiceLoss
 
 
 def _mask(batch: int = 2, size: int = 8) -> torch.Tensor:

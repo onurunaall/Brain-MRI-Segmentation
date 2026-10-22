@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 import torch
 
-from augmentations import (AugmentationPipeline, RandomBrightness, RandomGamma, RandomRotation, RandomScale,
-                           build_augmentation_pipeline)
+from mriseg.augmentations import (AugmentationPipeline, RandomBrightness, RandomGamma, RandomRotation, RandomScale,
+                                  build_augmentation_pipeline)
 
 
 def _zscored_slice(size: int = 32, channels: int = 3) -> tuple:
@@ -28,6 +28,20 @@ def test_padding_and_rotation_fill_with_the_background_not_zero(stage: object) -
         np.testing.assert_allclose(out[0, 0], image[0, 0], atol=1e-6)
         np.testing.assert_allclose(out[-1, -1], image[-1, -1], atol=1e-6)
         assert out.min() >= image.min() - 1e-6
+
+
+def test_random_scale_keeps_the_mask_on_the_image() -> None:
+    # The same circle in the image and the mask must stay in the same place; nearest resizing that is not centred
+    # would shift every training label half a pixel down-right of its image
+    torch.manual_seed(0)
+    yy, xx = np.mgrid[:64, :64]
+    circle = torch.from_numpy(((yy - 31.5) ** 2 + (xx - 31.5) ** 2 <= 100).astype(np.float32))[None]
+    for _ in range(20):
+        image, mask = RandomScale(0.05)(circle.clone(), circle.clone())
+        image_rows, image_cols = np.nonzero((image[0] > 0.5).numpy())
+        mask_rows, mask_cols = np.nonzero((mask[0] > 0.5).numpy())
+        assert abs(image_rows.mean() - mask_rows.mean()) < 0.3
+        assert abs(image_cols.mean() - mask_cols.mean()) < 0.3
 
 
 def test_intensity_stages_keep_background_shape_and_mask() -> None:

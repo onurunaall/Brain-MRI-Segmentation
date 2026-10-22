@@ -2,7 +2,7 @@
 TensorBoard logging wrapper for training metrics and image visualization.
 """
 
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import numpy.typing as npt
@@ -27,18 +27,6 @@ class TensorBoardLogger:
         :param global_step: Training step counter
         """
         self.writer.add_scalar(tag, value, global_step)
-        self.writer.flush()
-
-    def log_image(self, tag: str, image: npt.NDArray[np.uint8], global_step: int) -> None:
-        """
-        Log a single image.
-
-        :param tag: Image label
-        :param image: HWC uint8 array
-        :param global_step: Training step counter
-        """
-        # SummaryWriter expects (H, W, C) for add_image with dataformats='HWC'
-        self.writer.add_image(tag, image, global_step, dataformats="HWC")
         self.writer.flush()
 
     def log_image_batch(self,
