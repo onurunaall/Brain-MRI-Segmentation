@@ -1,15 +1,17 @@
 """Tests for aggregate.ResultsAggregator."""
 
 import csv
+import io
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
 import pytest
 
-from mriseg.aggregate import ResultsAggregator, write_csv
+from mriseg.aggregate import ResultsAggregator, print_table, write_csv
 from conftest import write_run
 
 
@@ -99,6 +101,19 @@ def test_fold_spread_averages_seeds_within_each_fold_first(runs_dir: str) -> Non
     write_run(runs_dir, "unet", 1, 1, {"B": _metrics(0.8)})
     row = _rows_by_arch(runs_dir)["unet"]
     assert row["fold_mean_std"] == pytest.approx(np.std([0.6, 0.8], ddof=1))
+
+
+def test_table_prints_when_output_is_redirected_on_windows(two_arch_runs: str,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    # Redirected output on Windows (a file, a pipe, Git Bash) is written in cp1252; a character it cannot encode
+    # (it once was "Δ") crashed the table before summary.csv was written
+    agg = ResultsAggregator(two_arch_runs)
+    agg.load()
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp1252"))
+    print_table(agg.summarize("unet"), "unet")
+    sys.stdout.flush()
+    assert b"delta vs unet" in raw.getvalue()
 
 
 def test_write_csv(two_arch_runs: str, tmp_path: Path) -> None:

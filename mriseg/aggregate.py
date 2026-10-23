@@ -119,7 +119,8 @@ class ResultsAggregator:
 
 
 def print_table(rows: List[Dict[str, Any]], baseline: str) -> None:
-    header = "| arch | runs | patients | Dice mean ± std | median | min | Dice (no post-processing) | fold-mean std | HD95 median (px) | Δ vs " + baseline + " | Wilcoxon p |"
+    # No "Δ": Windows writes redirected output in cp1252, which cannot encode it (the "±" it can)
+    header = "| arch | runs | patients | Dice mean ± std | median | min | Dice (no post-processing) | fold-mean std | HD95 median (px) | delta vs " + baseline + " | Wilcoxon p |"
     print(header)
     print("|" + "---|" * 11)
     for r in rows:
