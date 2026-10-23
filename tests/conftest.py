@@ -5,18 +5,15 @@ Shared pytest fixtures. Tests use small synthetic arrays only: no dataset downlo
 import csv
 import json
 import os
-import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
 
 import numpy as np
 import pytest
-
-# Make the repo's top-level modules (utils, compare, ...) importable from tests/
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from skimage.io import imsave
 
 HISTORY_HEADER = ["epoch", "train_loss", "val_loss", "val_dice", "lr", "seconds", "new_best"]
 
@@ -31,7 +28,7 @@ def write_run(runs_dir: str,
     """
     Create one run folder in the layout run_cv.sh produces.
 
-    :param per_patient: patient_id -> {"dice", "dice_raw", "hd95_vox"}
+    :param per_patient: patient_id -> {"dice", "dice_raw", "hd95_px"}
     :param masks: npz arrays keyed '<pid>__flair' / '<pid>__gt' / '<pid>__pred' (written to test_masks.npz)
     :param history: rows for logs/history.csv, in HISTORY_HEADER order
     :return: run directory path
@@ -71,6 +68,29 @@ def patient_volume(n_slices: int = 5,
         gt[s, c - r: c + r, c - r: c + r] = 1
         flair[s, c - r: c + r, c - r: c + r] = 220
     return flair, gt
+
+
+def write_patient(root: Path, pid: str, n_slices: int, tumour_slices: Sequence[int],
+                  mask_slices: Optional[Sequence[int]] = None, size: int = 16) -> None:
+    """
+    Slices <pid>_<i>.tif (RGB) and <pid>_<i>_mask.tif numbered from 1, as in the Kaggle dataset.
+    `mask_slices` limits which slices get a mask file (default: all; () = an unlabelled new patient).
+    """
+    folder = root / pid
+    folder.mkdir(parents=True)
+    yy, xx = np.mgrid[:size, :size]
+    # Round, so the cropped image still has background corners
+    head = (yy - size // 2) ** 2 + (xx - size // 2) ** 2 <= (3 * size // 8) ** 2
+
+    for i in range(1, n_slices + 1):
+        image = np.zeros((size, size, 3), dtype=np.uint8)
+        image[head] = (20 * i, 30 + 10 * i, 200 - 15 * i)  # every slice and channel differs
+        mask = np.zeros((size, size), dtype=np.uint8)
+        if i in tumour_slices:
+            mask[size // 2 - 2: size // 2 + 2, size // 2 - 2: size // 2 + 2] = 255
+        imsave(str(folder / f"{pid}_{i}.tif"), image, check_contrast=False)
+        if mask_slices is None or i in mask_slices:
+            imsave(str(folder / f"{pid}_{i}_mask.tif"), mask, check_contrast=False)
 
 
 @pytest.fixture

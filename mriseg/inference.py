@@ -15,9 +15,8 @@ import numpy.typing as npt
 import torch
 import torch.nn as nn
 
-from dataset import MRISegmentationDataset as SegDataset
-from evaluation import PatientEvaluator
-from network import ModelFactory
+from mriseg.dataset import MRISegmentationDataset as SegDataset
+from mriseg.network import create_model
 
 COMPILE_MODES: List[str] = ["none", "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]
 BUNDLE_MANIFEST = "manifest.json"
@@ -38,29 +37,65 @@ def compile_model(model: nn.Module, mode: str) -> nn.Module:
     return cast(nn.Module, torch.compile(model, mode=mode))
 
 
-def load_trained_model(arch: str,
-                       checkpoint_path: str,
-                       device: torch.device,
-                       context_slices: int = 0) -> nn.Module:
+def save_checkpoint(path: str, state_dict: Dict[str, torch.Tensor], meta: Dict[str, Any]) -> None:
     """
-    Build the architecture and load a checkpoint saved by train.py (or a bundle's model.pt).
+    Save model weights together with the record of how they were trained. The record is the single source of the
+    model's settings: predict.py and export_models.py read the architecture, input size and patients from it.
 
-    :param arch: Architecture name registered in ModelFactory
-    :param checkpoint_path: Path to a state_dict .pt file
-    :param device: Device to load the model onto
-    :param context_slices: Neighbour slices per side the model was trained with (train.py --context-slices)
-    :return: The model (returning logits) in eval mode on `device`
+    :param path: Output .pt file
+    :param state_dict: Model weights (of the uncompiled model)
+    :param meta: train.py's record (arch, context_slices, image_size, fold, seed, split settings, train / validation
+                 / test patients)
     """
-    model = ModelFactory.create(arch,
-                                in_channels=SegDataset.num_input_channels(context_slices),
-                                out_channels=SegDataset.num_output_channels)
-    state = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    try:
-        model.load_state_dict(PatientEvaluator.strip_compile_prefix(state))
-    except RuntimeError as exc:
-        raise RuntimeError(f"{checkpoint_path} does not fit a {arch} with --context-slices {context_slices}; "
-                           f"pass the value it was trained with (models trained before 2.5D input need 0)") from exc
-    return model.to(device).eval()
+    torch.save({"state_dict": state_dict, "meta": meta}, path)
+
+
+def read_checkpoint(path: str, device: torch.device) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    """
+    Read a checkpoint written by save_checkpoint.
+
+    :param path: .pt file
+    :param device: Device to load the tensors onto
+    :return: (state_dict, meta)
+    """
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    if "meta" not in checkpoint:
+        raise ValueError(f"{path} holds only weights (saved by an older version of train.py), so its architecture, "
+                         f"input size and patients are unknown; retrain it")
+    return checkpoint["state_dict"], checkpoint["meta"]
+
+
+def load_trained_model(checkpoint_path: str, device: torch.device) -> Tuple[nn.Module, Dict[str, Any]]:
+    """
+    Rebuild the network described by a checkpoint's record and load its weights.
+
+    :param checkpoint_path: .pt checkpoint saved by train.py (or a bundle's model.pt)
+    :param device: Device to load the model onto
+    :return: (model returning logits, in eval mode on `device`; the checkpoint's record)
+    """
+    state, meta = read_checkpoint(checkpoint_path, device)
+    model = create_model(meta["arch"],
+                         in_channels=SegDataset.num_input_channels(meta["context_slices"]),
+                         out_channels=SegDataset.num_output_channels)
+    model.load_state_dict(state)
+    return model.to(device).eval(), meta
+
+
+def model_record(model_path: str) -> Dict[str, Any]:
+    """
+    The training record of a model file: from the checkpoint itself for .pt, and from the model.pt next to it for
+    exported .onnx / .engine / .plan files (export_models.py writes them side by side).
+
+    :param model_path: Model file
+    :return: The record saved by train.py
+    """
+    checkpoint_path = model_path
+    if os.path.splitext(model_path)[1].lower() != ".pt":
+        checkpoint_path = os.path.join(os.path.dirname(model_path), "model.pt")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"{model_path} has no model.pt next to it, so its training record is unknown; "
+                                    f"use the files export_models.py writes")
+    return read_checkpoint(checkpoint_path, torch.device("cpu"))[1]
 
 
 class InferenceBackend(ABC):
@@ -216,26 +251,21 @@ class EnsembleBackend(InferenceBackend):
 
 
 def create_backend(model_path: str,
-                   arch: str,
                    device: torch.device,
                    compile_mode: str = "none",
-                   use_amp: bool = False,
-                   context_slices: int = 0) -> InferenceBackend:
+                   use_amp: bool = False) -> InferenceBackend:
     """
     Pick the backend from the file type: .pt checkpoint -> PyTorch, .onnx -> ONNX Runtime, .engine/.plan -> TensorRT.
 
     :param model_path: Model file
-    :param arch: Architecture name (only used to rebuild the network for .pt checkpoints)
     :param device: Device to run on
     :param compile_mode: torch.compile mode; only valid for .pt checkpoints
     :param use_amp: fp16 autocast; only valid for .pt checkpoints (ONNX / TensorRT precision is fixed at export)
-    :param context_slices: Neighbour slices per side (only used to rebuild the network for .pt checkpoints;
-                           exported files have their input shape built in)
     :return: Backend ready for predict()
     """
     extension = os.path.splitext(model_path)[1].lower()
     if extension == ".pt":
-        model = load_trained_model(arch, model_path, device, context_slices)
+        model, _ = load_trained_model(model_path, device)
         return PyTorchBackend(model, device, compile_mode, use_amp)
 
     if compile_mode != "none" or use_amp:
@@ -279,7 +309,5 @@ def load_bundle(bundle_dir: str,
         path = os.path.join(bundle_dir, member["name"], file_name)
         if not os.path.exists(path):
             raise FileNotFoundError(f"{path} does not exist; export it with export_models.py --formats")
-        # Bundles written before 2.5D input have no context_slices entry: their models take one slice
-        members.append(create_backend(path, manifest["arch"], device, compile_mode, use_amp,
-                                      manifest.get("context_slices", 0)))
+        members.append(create_backend(path, device, compile_mode, use_amp))
     return EnsembleBackend(members), manifest

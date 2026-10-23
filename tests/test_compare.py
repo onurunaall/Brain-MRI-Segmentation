@@ -2,14 +2,14 @@
 
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import numpy as np
 import pytest
 from matplotlib.figure import Figure
 
-import compare
-from compare import ComparisonPlotter, GalleryEntry
+from mriseg import compare
+from mriseg.compare import ComparisonPlotter, GalleryEntry
 from conftest import HISTORY_HEADER, patient_volume, write_run
 
 
@@ -37,10 +37,10 @@ def full_runs(runs_dir: str) -> str:
     folds = {0: ["P0", "P1"], 1: ["P2", "P3"]}
     for fold, pids in folds.items():
         write_run(runs_dir, "unet", fold, 0,
-                  {p: {"dice": 0.6, "dice_raw": 0.55, "hd95_vox": 5.0} for p in pids},
+                  {p: {"dice": 0.6, "dice_raw": 0.55, "hd95_px": 5.0} for p in pids},
                   masks=_masks_for(pids, _shifted), history=history)
         write_run(runs_dir, "resunet", fold, 0,
-                  {p: {"dice": 0.9, "dice_raw": 0.85, "hd95_vox": 1.0} for p in pids},
+                  {p: {"dice": 0.9, "dice_raw": 0.85, "hd95_px": 1.0} for p in pids},
                   masks=_masks_for(pids, lambda gt: gt), history=history)
     return runs_dir
 
@@ -135,54 +135,6 @@ def test_history_header_matches_train_py() -> None:
     assert str(HISTORY_HEADER).replace("'", '"') in source
 
 
-def _write_tb_events(log_dir: str,
-                     val_points: List[Tuple[int, float, float]],
-                     train_points: List[Tuple[int, float]]) -> None:
-    from torch.utils.tensorboard import SummaryWriter
-    writer = SummaryWriter(log_dir=log_dir)
-    for step, value in train_points:
-        writer.add_scalar("train/loss", value, step)
-    for step, loss, dice in val_points:
-        writer.add_scalar("val/loss", loss, step)
-        writer.add_scalar("val/dice", dice, step)
-    writer.close()
-
-
-def test_read_history_tensorboard(tmp_path: Path) -> None:
-    # Two epochs ending at steps 20 and 40; train loss logged every 10 steps as in train.py
-    log_dir = str(tmp_path / "logs")
-    _write_tb_events(log_dir,
-                     val_points=[(20, 0.9, 0.2), (40, 0.7, 0.5)],
-                     train_points=[(9, 1.0), (19, 0.8), (29, 0.6), (39, 0.4)])
-
-    hist = ComparisonPlotter._read_history_tensorboard(log_dir)
-
-    assert hist is not None
-    np.testing.assert_allclose(hist["epoch"], [1, 2])
-    np.testing.assert_allclose(hist["val_loss"], [0.9, 0.7], rtol=1e-6)
-    np.testing.assert_allclose(hist["val_dice"], [0.2, 0.5], rtol=1e-6)
-    np.testing.assert_allclose(hist["train_loss"], [0.9, 0.5], rtol=1e-6)  # mean of points inside each epoch
-
-
-def test_read_history_tensorboard_uses_newest_event_file(tmp_path: Path) -> None:
-    """A crashed-then-restarted run leaves two event files; only the newest (complete) one counts."""
-    log_dir = str(tmp_path / "logs")
-    _write_tb_events(log_dir, val_points=[(10, 0.99, 0.01)], train_points=[])
-    old_file = [f for f in os.listdir(log_dir) if f.startswith("events")][0]
-    os.utime(os.path.join(log_dir, old_file), (1, 1))  # make it clearly older
-    _write_tb_events(log_dir, val_points=[(10, 0.5, 0.6), (20, 0.4, 0.7)], train_points=[])
-
-    hist = ComparisonPlotter._read_history_tensorboard(log_dir)
-    assert hist is not None
-    np.testing.assert_allclose(hist["val_dice"], [0.6, 0.7], rtol=1e-6)
-
-
-def test_read_history_tensorboard_without_events_returns_none(tmp_path: Path) -> None:
-    assert ComparisonPlotter._read_history_tensorboard(str(tmp_path)) is None
-
-
-# ------------------------------------------------------------- plotting
-
 def test_all_figures_are_written(full_runs: str, tmp_path: Path) -> None:
     plotter = _plotter(full_runs, tmp_path)
     plotter.plot_metric_distributions()
@@ -211,7 +163,7 @@ def test_max_patients_limits_segmentation_figures(full_runs: str, tmp_path: Path
 def test_missing_masks_skip_segmentation_without_error(runs_dir: str,
                                                         tmp_path: Path,
                                                         capsys: pytest.CaptureFixture[str]) -> None:
-    write_run(runs_dir, "unet", 0, 0, {"A": {"dice": 0.5, "dice_raw": 0.5, "hd95_vox": 1.0}})
+    write_run(runs_dir, "unet", 0, 0, {"A": {"dice": 0.5, "dice_raw": 0.5, "hd95_px": 1.0}})
     plotter = _plotter(runs_dir, tmp_path)
     plotter.plot_segmentation_grids(max_patients=None)
     plotter.plot_dice_vs_volume()
@@ -225,7 +177,7 @@ def test_paired_plot_counts_ties_within_tolerance(runs_dir: str,
     base = {"A": 0.5, "B": 0.5, "C": 1e-7, "D": 0.5}
     other = {"A": 0.6, "B": 0.4, "C": 2e-7, "D": 0.5}  # better, worse, tie (noise), tie
     for arch, scores in (("unet", base), ("resunet", other)):
-        write_run(runs_dir, arch, 0, 0, {p: {"dice": d, "dice_raw": d, "hd95_vox": 1.0} for p, d in scores.items()})
+        write_run(runs_dir, arch, 0, 0, {p: {"dice": d, "dice_raw": d, "hd95_px": 1.0} for p, d in scores.items()})
 
     saved: Dict[str, Figure] = {}
     monkeypatch.setattr(ComparisonPlotter, "_save", lambda self, fig, name: saved.setdefault(name, fig))
@@ -237,7 +189,7 @@ def test_paired_plot_counts_ties_within_tolerance(runs_dir: str,
 
 def test_seed_selection_for_masks(runs_dir: str, tmp_path: Path) -> None:
     for seed in (0, 1):
-        write_run(runs_dir, "unet", 0, seed, {"P0": {"dice": 0.5, "dice_raw": 0.5, "hd95_vox": 1.0}},
+        write_run(runs_dir, "unet", 0, seed, {"P0": {"dice": 0.5, "dice_raw": 0.5, "hd95_px": 1.0}},
                   masks=_masks_for(["P0"], lambda gt: gt))
 
     default_run = _plotter(runs_dir, tmp_path)._mask_run("unet", 0)
@@ -256,36 +208,48 @@ def test_no_runs_exits(tmp_path: Path) -> None:
 # ------------------------------------------------------ predict._save_masks
 
 def test_save_masks_round_trip(tmp_path: Path) -> None:
-    from predict import _save_masks
+    from mriseg.predict import _save_masks
 
     rng = np.random.default_rng(0)
-    vol_in = rng.normal(size=(3, 3, 8, 8)).astype(np.float32)  # (Z, C, H, W), channel 1 = FLAIR
-    gt = np.zeros((3, 1, 8, 8), dtype=np.float32)
-    gt[1, 0, 2:5, 2:5] = 1.0
-    pred = gt.astype(bool)  # LCC output is boolean
+    flair = {"P0": rng.normal(size=(3, 8, 8)).astype(np.float32)}
+    gt = np.zeros((3, 8, 8), dtype=np.float32)
+    gt[1, 2:5, 2:5] = 1.0
+    pred = gt.astype(bool)  # post-processing output is boolean
 
     path = tmp_path / "nested" / "masks.npz"
-    _save_masks(str(path), {"P0": (vol_in, pred, gt)})
+    _save_masks(str(path), flair, {"P0": gt}, {"P0": pred}, {"P0": gt * 0.8})
 
     with np.load(path) as npz:
-        assert sorted(npz.files) == ["P0__flair", "P0__gt", "P0__pred"]
-        flair = npz["P0__flair"]
-        assert flair.dtype == np.uint8 and flair.shape == (3, 8, 8)
-        assert flair.min() == 0 and flair.max() == 255
+        assert sorted(npz.files) == ["P0__flair", "P0__gt", "P0__pred", "P0__prob"]
+        saved_flair = npz["P0__flair"]
+        assert saved_flair.dtype == np.uint8 and saved_flair.shape == (3, 8, 8)
+        assert saved_flair.min() == 0 and saved_flair.max() == 255
         # min-max scaling preserves the ordering of FLAIR intensities
-        assert np.argmax(flair) == np.argmax(vol_in[:, 1])
-        np.testing.assert_array_equal(npz["P0__gt"], gt[:, 0].astype(np.uint8))
-        np.testing.assert_array_equal(npz["P0__pred"], pred[:, 0].astype(np.uint8))
+        assert np.argmax(saved_flair) == np.argmax(flair["P0"])
+        np.testing.assert_array_equal(npz["P0__gt"], gt.astype(np.uint8))
+        np.testing.assert_array_equal(npz["P0__pred"], pred.astype(np.uint8))
 
 
 def test_save_masks_constant_flair(tmp_path: Path) -> None:
-    from predict import _save_masks
+    from mriseg.predict import _save_masks
 
-    vol_in = np.ones((2, 3, 4, 4), dtype=np.float32)
-    zeros = np.zeros((2, 1, 4, 4))
-    _save_masks(str(tmp_path / "m.npz"), {"P": (vol_in, zeros.astype(int), zeros)})
+    zeros = {"P": np.zeros((2, 4, 4))}
+    _save_masks(str(tmp_path / "m.npz"), {"P": np.ones((2, 4, 4), dtype=np.float32)}, zeros, zeros, zeros)
     with np.load(tmp_path / "m.npz") as npz:
         assert np.all(npz["P__flair"] == 0)
+
+
+def test_segmentation_figures_show_the_dice_of_the_run_drawn(runs_dir: str, tmp_path: Path,
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    for seed, dice in ((0, 0.2), (1, 0.8)):
+        write_run(runs_dir, "unet", 0, seed, {"P0": {"dice": dice, "dice_raw": dice, "hd95_px": 1.0}},
+                  masks=_masks_for(["P0"], lambda gt: gt))
+    shown: Dict[str, float] = {}
+    monkeypatch.setattr(ComparisonPlotter, "_draw_patient", lambda self, *args: shown.update(args[7]))
+    monkeypatch.setattr(ComparisonPlotter, "_draw_overview", lambda self, overview: None)
+
+    _plotter(runs_dir, tmp_path).plot_segmentation_grids(max_patients=None)
+    assert shown == {"unet": 0.2}  # seed 0's masks are drawn, so seed 0's Dice, not the seed mean 0.5
 
 
 # ------------------------------------------------ per-architecture galleries
@@ -312,7 +276,7 @@ def test_gallery_case_has_probability_column_only_when_saved(runs_dir: str, tmp_
     masks = _masks_for(["P0"], _shifted)
     if with_probability:
         masks["P0__prob"] = (masks["P0__pred"] * 200).astype(np.uint8)
-    write_run(runs_dir, "unet", 0, 0, {"P0": {"dice": 0.6, "dice_raw": 0.6, "hd95_vox": 1.0}}, masks=masks)
+    write_run(runs_dir, "unet", 0, 0, {"P0": {"dice": 0.6, "dice_raw": 0.6, "hd95_px": 1.0}}, masks=masks)
 
     columns_per_file: Dict[str, int] = {}
 

@@ -8,7 +8,6 @@ set -euo pipefail
 ARCHS=${ARCHS:-"unet resunet swinunetr"}
 FOLDS=${FOLDS:-"0 1 2 3 4"}
 SEEDS=${SEEDS:-"0 1 2"}
-CONTEXT_SLICES=${CONTEXT_SLICES:-1}  # must match the value the models were trained with (run_cv.sh)
 VARIANTS=${VARIANTS:-"compile fp32.onnx fp16.onnx fp32.engine fp16.engine"}  # "compile" = model.pt + torch.compile
 DATA_DIR=${DATA_DIR:-./kaggle_3m}
 RUNS_DIR=${RUNS_DIR:-./runs}
@@ -27,6 +26,7 @@ for variant in $VARIANTS; do
           continue
         fi
 
+        # Exported files take their training record (fold, patients, input size) from the model.pt next to them
         if [ "$variant" = "compile" ]; then
           model_args=(--model-path "$member/model.pt" --compile default)
         else
@@ -34,14 +34,13 @@ for variant in $VARIANTS; do
         fi
 
         echo "[$variant] $run"
-        python predict.py --arch "$arch" --fold "$fold" --seed "$seed" --split test --data-dir "$DATA_DIR" \
-          --context-slices "$CONTEXT_SLICES" \
+        python -m mriseg.predict --split test --data-dir "$DATA_DIR" \
           "${model_args[@]}" --results-json "$results" --figure-path "$run/dice_distribution.$variant.png" \
           --output-dir "$run/predictions" --skip-overlays
       done
     done
   done
 
-  python aggregate.py --runs-dir "$RUNS_DIR" --baseline unet --results-name "test_results.$variant.json" \
+  python -m mriseg.aggregate --runs-dir "$RUNS_DIR" --baseline unet --results-name "test_results.$variant.json" \
     --csv "$RUNS_DIR/summary.$variant.csv"
 done

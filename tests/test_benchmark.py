@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from benchmark import ModelBenchmark
+from mriseg.benchmark import ModelBenchmark
 
 HAS_ONNX = all(importlib.util.find_spec(name) is not None for name in ("onnx", "onnxscript", "onnxruntime"))
 

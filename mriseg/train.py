@@ -3,28 +3,31 @@ import csv
 import json
 import os
 import time
-from typing import List, Tuple, cast
+from typing import Dict, List, Tuple, cast
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
-from dataset import MRISegmentationDataset as SegDataset
-from tb_logger import TensorBoardLogger
-from losses import DiceBCELoss
-from augmentations import build_augmentation_pipeline
-from network import ModelFactory
-from inference import COMPILE_MODES, compile_model
-from utils import compose_visualization, dice_similarity_coefficient, Reproducibility
+from mriseg.dataset import MRISegmentationDataset as SegDataset, find_patients, split_patients
+from mriseg.tb_logger import TensorBoardLogger
+from mriseg.losses import DiceBCELoss
+from mriseg.augmentations import build_augmentation_pipeline
+from mriseg.network import available_architectures, create_model
+from mriseg.inference import COMPILE_MODES, compile_model, save_checkpoint
+from mriseg.evaluation import raw_dice_per_patient
+from mriseg.utils import compose_visualization, seed_everything
 
 
-def _create_dataloaders(cfg: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
+def _create_dataloaders(cfg: argparse.Namespace, splits: Dict[str, List[str]]) -> Tuple[DataLoader, DataLoader]:
     """
     Build training and validation DataLoaders.
 
     :param cfg: Parsed arguments
+    :param splits: Patient lists from split_patients
     :return: (train_loader, val_loader) tuple
     """
     augmentation = build_augmentation_pipeline(scale_range=cfg.aug_scale,
@@ -33,31 +36,21 @@ def _create_dataloaders(cfg: argparse.Namespace) -> Tuple[DataLoader, DataLoader
                                                brightness_range=cfg.aug_brightness,
                                                gamma_range=cfg.aug_gamma)
 
-    train_ds = SegDataset(data_root=cfg.data_dir,
-                          split="train",
+    train_ds = SegDataset(cfg.data_dir,
+                          splits["train"],
                           resolution=cfg.image_size,
-                          transform=augmentation,
-                          n_validation=cfg.n_validation,
-                          seed=cfg.split_seed,
-                          fold=cfg.fold,
-                          n_folds=cfg.n_folds,
-                          context_slices=cfg.context_slices)
+                          context_slices=cfg.context_slices,
+                          transform=augmentation)
 
-    val_ds = SegDataset(data_root=cfg.data_dir,
-                        split="validation",
+    val_ds = SegDataset(cfg.data_dir,
+                        splits["validation"],
                         resolution=cfg.image_size,
-                        n_validation=cfg.n_validation,
-                        seed=cfg.split_seed,
-                        fold=cfg.fold,
-                        n_folds=cfg.n_folds,
                         context_slices=cfg.context_slices)
 
-    def _seed_worker(worker_id: int) -> None:
-        worker_info = torch.utils.data.get_worker_info()
-        assert worker_info is not None, "worker_init_fn only runs inside DataLoader workers"
-        np.random.seed(worker_info.seed % (2**32))
-
     # Use WeightedRandomSampler to bias towards slices with more foreground
+    # (PyTorch seeds Python, NumPy and torch in every worker, so no worker_init_fn is needed.)
+    # persistent_workers keeps the workers between epochs: on Windows / macOS every new worker gets its own copy of
+    # the whole preprocessed dataset, which would otherwise be re-sent each epoch.
     train_sampler = WeightedRandomSampler(weights=train_ds.sample_weights,
                                           num_samples=len(train_ds),
                                           replacement=True)
@@ -67,14 +60,14 @@ def _create_dataloaders(cfg: argparse.Namespace) -> Tuple[DataLoader, DataLoader
                               sampler=train_sampler,
                               drop_last=True,
                               num_workers=cfg.num_workers,
-                              worker_init_fn=_seed_worker,
+                              persistent_workers=cfg.num_workers > 0,
                               pin_memory=True)
-    
+
     val_loader = DataLoader(val_ds,
                             batch_size=cfg.batch_size,
                             drop_last=False,
                             num_workers=cfg.num_workers,
-                            worker_init_fn=_seed_worker)
+                            persistent_workers=cfg.num_workers > 0)
 
     return train_loader, val_loader
 
@@ -84,45 +77,97 @@ def _segmentation_dataset(loader: DataLoader) -> SegDataset:
     return cast(SegDataset, loader.dataset)
 
 
-def _per_volume_dice(all_preds: List[np.ndarray],
-                     all_targets: List[np.ndarray],
-                     flat_index: List[Tuple[int, int]]) -> List[float]:
+def train_one_epoch(model: nn.Module,
+                    loader: DataLoader,
+                    criterion: nn.Module,
+                    optimizer: optim.Optimizer,
+                    scaler: torch.amp.GradScaler,
+                    device: torch.device,
+                    logger: TensorBoardLogger,
+                    global_step: int,
+                    desc: str) -> Tuple[float, int]:
     """
-    Compute Dice score per patient volume (not per slice), thresholded at 0.5 and without post-processing:
-    largest-connected-component filtering can swap in a false-positive blob and make the score jump between epochs.
+    One pass over the training data (fp16 autocast on CUDA). The mean loss of every 10 steps goes to TensorBoard.
 
-    :param all_preds: Flat list of per-slice probability arrays
-    :param all_targets: Flat list of per-slice ground-truth arrays
-    :param flat_index: Mapping from flat position → (patient_idx, slice_idx)
-    :return: List of Dice scores, one per patient
+    :param global_step: Optimizer steps taken before this epoch
+    :param desc: Progress bar label
+    :return: (mean training loss of the epoch, global step after the epoch)
     """
-    scores: List[float] = []
-    slices_per_patient = np.bincount([entry[0] for entry in flat_index])
-    offset = 0
+    model.train()
+    epoch_losses: List[float] = []
+    recent_losses: List[float] = []  # since the last TensorBoard point
 
-    for n_slices in slices_per_patient:
-        vol_pred = (np.array(all_preds[offset: offset + n_slices]) > 0.5).astype(np.float32)
-        vol_true = np.array(all_targets[offset: offset + n_slices])
-        scores.append(dice_similarity_coefficient(vol_pred, vol_true, apply_lcc=False))
-        offset += n_slices
+    pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+    for inputs, targets in pbar:
+        global_step += 1
+        inputs, targets = inputs.to(device), targets.to(device)
 
-    return scores
+        optimizer.zero_grad()
+        with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+            loss = criterion(model(inputs), targets)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        epoch_losses.append(loss.item())
+        recent_losses.append(loss.item())
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        if (global_step + 1) % 10 == 0:
+            logger.log_scalar("train/loss", float(np.mean(recent_losses)), global_step)
+            recent_losses = []
+
+    return (float(np.mean(epoch_losses)) if epoch_losses else float("nan")), global_step
 
 
-def _log_mean_loss(logger: TensorBoardLogger,
-                   losses: List[float],
-                   step: int,
-                   prefix: str = "") -> None:
+@torch.no_grad()
+def validate(model: nn.Module,
+             loader: DataLoader,
+             criterion: nn.Module,
+             device: torch.device,
+             desc: str) -> Tuple[float, float, List[np.ndarray]]:
     """
-    Log the mean of accumulated losses and clear the buffer.
+    Validation loss and Dice. The Dice is per patient volume on the preprocessed grid, thresholded at 0.5 and without
+    post-processing: largest-connected-component filtering can swap in a false-positive blob and make the score jump.
 
-    :param logger: TensorBoard logger instance
-    :param losses: List of scalar loss values
-    :param step: Current training step
-    :param prefix: Tag prefix (e.g. 'train/' or 'val/')
+    :param desc: Progress bar label
+    :return: (mean loss, mean per-patient Dice, per-slice probabilities (1, H, W) in dataset order)
     """
-    if losses:
-        logger.log_scalar(f"{prefix}loss", float(np.mean(losses)), step)
+    model.eval()
+    losses: List[float] = []
+    probabilities: List[np.ndarray] = []
+    targets: List[np.ndarray] = []
+
+    pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+    for inputs, masks in pbar:
+        inputs, masks = inputs.to(device), masks.to(device)
+        with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+            logits = model(inputs)
+            loss = criterion(logits, masks)
+
+        losses.append(loss.item())
+        probabilities.extend(torch.sigmoid(logits.float()).cpu().numpy())  # the model returns logits
+        targets.extend(masks.cpu().numpy())
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+    dataset = _segmentation_dataset(loader)
+    dice = raw_dice_per_patient(probabilities, targets, dataset.flat_index, dataset.patient_ids)
+    return float(np.mean(losses)), float(np.mean(list(dice.values()))), probabilities
+
+
+def _log_overlays(logger: TensorBoardLogger,
+                  dataset: SegDataset,
+                  probabilities: List[np.ndarray],
+                  n_images: int,
+                  step: int) -> None:
+    """TensorBoard images of the first n_images validation slices: prediction (red) and ground truth (green)."""
+    flair_channel = SegDataset.flair_channel(dataset.context_slices)
+    overlays = []
+    for idx in range(min(n_images, len(dataset))):
+        image, mask = dataset[idx]
+        probability = torch.from_numpy(probabilities[idx])
+        overlays.extend(compose_visualization(image[None], mask[None], probability[None], channel_idx=flair_channel))
+    logger.log_image_batch("image", overlays, step)
 
 
 def _ensure_directories(cfg: argparse.Namespace) -> None:
@@ -132,7 +177,7 @@ def _ensure_directories(cfg: argparse.Namespace) -> None:
 
 
 def _save_config(cfg: argparse.Namespace) -> None:
-    """Persist training configuration as JSON for reproducibility."""
+    """Save the command-line settings as JSON, for people reading the run folder later."""
     config_path = os.path.join(cfg.log_dir, "config.json")
     with open(config_path, "w") as fp:
         json.dump(vars(cfg), fp, indent=2)
@@ -194,19 +239,20 @@ def run_training(cfg: argparse.Namespace) -> None:
     """
     _ensure_directories(cfg)
     _save_config(cfg)
-    Reproducibility.seed_everything(cfg.seed)
+    seed_everything(cfg.seed)
 
     device = torch.device("cpu" if not torch.cuda.is_available() else cfg.device)
 
-    train_loader, val_loader = _create_dataloaders(cfg)
-    phase_loaders = {"train": train_loader, "valid": val_loader}
+    splits = split_patients(sorted(find_patients(cfg.data_dir)), cfg.fold, cfg.n_folds, cfg.n_validation,
+                            cfg.split_seed)
+    train_loader, val_loader = _create_dataloaders(cfg, splits)
 
-    model = ModelFactory.create(
+    model = create_model(
         cfg.arch,
         in_channels=SegDataset.num_input_channels(cfg.context_slices),
         out_channels=SegDataset.num_output_channels
     )
-    
+
     model.to(device)
     base_model = model  # uncompiled handle: its state_dict has no "_orig_mod." prefix
     n_params = sum(p.numel() for p in base_model.parameters())
@@ -217,22 +263,32 @@ def run_training(cfg: argparse.Namespace) -> None:
     model = compile_model(model, cfg.compile)
 
     criterion = DiceBCELoss()
-    center_channels = SegDataset.center_slice_channels(cfg.context_slices)  # for the TensorBoard overlays
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
-    best_val_dice = 0.0
+
+    # Saved inside best_model.pt: the single record of the model's settings and patients. predict.py and
+    # export_models.py read it, so they can never score the model on its own training patients.
+    checkpoint_meta = {"arch": cfg.arch,
+                       "context_slices": cfg.context_slices,
+                       "image_size": cfg.image_size,
+                       "fold": cfg.fold,
+                       "n_folds": cfg.n_folds,
+                       "split_seed": cfg.split_seed,
+                       "n_validation": cfg.n_validation,
+                       "seed": cfg.seed,
+                       "train_patients": splits["train"],
+                       "val_patients": splits["validation"],
+                       "test_patients": splits["test"]}
 
     logger = TensorBoardLogger(cfg.log_dir)
-    running_train_loss: List[float] = []
-    running_val_loss: List[float] = []
-
     global_step = 0
+    best_val_dice = 0.0
     best_epoch = -1
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    
+
     train_start = time.perf_counter()
 
     # Per-epoch history for later comparison plots (compare.py); overwritten if the run is restarted
@@ -243,107 +299,31 @@ def run_training(cfg: argparse.Namespace) -> None:
     for epoch in range(cfg.epochs):
         epoch_start = time.perf_counter()
         epoch_lr = scheduler.get_last_lr()[0]  # LR in effect for this epoch (stepped at epoch end)
-        epoch_train_losses: List[float] = []   # full-epoch buffer; running_train_loss is reset every 10 steps
+        desc = f"Epoch {epoch + 1:03d}/{cfg.epochs:03d}"
 
-        for phase in ("train", "valid"):
-            if phase == "train":
-                model.train()
-            else:
-                model.eval()
+        train_loss, global_step = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, logger,
+                                                  global_step, f"{desc} Train")
+        val_loss, val_dice, probabilities = validate(model, val_loader, criterion, device, f"{desc} Valid")
 
-            val_predictions: List[np.ndarray] = []
-            val_targets: List[np.ndarray] = []
+        logger.log_scalar("val/loss", val_loss, global_step)
+        logger.log_scalar("val/dice", val_dice, global_step)
+        if epoch % cfg.vis_frequency == 0 or epoch == cfg.epochs - 1:
+            _log_overlays(logger, _segmentation_dataset(val_loader), probabilities, cfg.n_vis_images, global_step)
 
-            # Wrap the phase DataLoader with tqdm
-            pbar = tqdm(
-                phase_loaders[phase],
-                desc=f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} {phase.capitalize():>5}",
-                leave=False,
-                dynamic_ncols=True
-            )
+        is_best = val_dice > best_val_dice
+        if is_best:
+            best_val_dice, best_epoch = val_dice, epoch
+            save_checkpoint(os.path.join(cfg.checkpoint_dir, "best_model.pt"), base_model.state_dict(),
+                            checkpoint_meta)
 
-            for batch_idx, (inputs, targets) in enumerate(pbar):
-                if phase == "train":
-                    global_step += 1
+        epoch_secs = time.perf_counter() - epoch_start
+        best_desc = f"{best_val_dice:.4f} (ep {best_epoch + 1:03d})" if best_epoch >= 0 else "n/a"
+        print(f"{desc} | train loss {train_loss:.4f} | val loss {val_loss:.4f} | val Dice {val_dice:.4f} | "
+              f"best {best_desc} | lr {epoch_lr:.2e} | time {epoch_secs:.1f}s" + (" (NEW BEST)" if is_best else ""))
 
-                inputs = inputs.to(device)
-                targets = targets.to(device)
+        with open(history_path, "a", newline="") as fp:
+            csv.writer(fp).writerow([epoch + 1, train_loss, val_loss, val_dice, epoch_lr, epoch_secs, int(is_best)])
 
-                optimizer.zero_grad()
-                with torch.set_grad_enabled(phase == "train"):
-                    with torch.amp.autocast(device_type=device.type,
-                                            enabled=(device.type == "cuda")):
-                        outputs = model(inputs)
-                        batch_loss = criterion(outputs, targets)
-
-                    if phase == "valid":
-                        running_val_loss.append(batch_loss.item())
-
-                        probabilities = torch.sigmoid(outputs.float())  # the model returns logits
-                        preds_np = probabilities.detach().cpu().numpy()
-                        val_predictions.extend(preds_np[s] for s in range(preds_np.shape[0]))
-
-                        tgts_np = targets.detach().cpu().numpy()
-                        val_targets.extend(tgts_np[s] for s in range(tgts_np.shape[0]))
-
-                        is_vis_epoch = (epoch % cfg.vis_frequency == 0) or (epoch == cfg.epochs - 1)
-                        if is_vis_epoch and batch_idx * cfg.batch_size < cfg.n_vis_images:
-                            vis_tag = f"image/{batch_idx}"
-                            n_remaining = cfg.n_vis_images - batch_idx * cfg.batch_size
-
-                            overlays = compose_visualization(inputs[:, center_channels], targets, probabilities)
-                            logger.log_image_batch(vis_tag, overlays[:n_remaining], global_step)
-
-                    if phase == "train":
-                        running_train_loss.append(batch_loss.item())
-                        epoch_train_losses.append(batch_loss.item())
-                        scaler.scale(batch_loss).backward()
-                        scaler.step(optimizer)
-                        scaler.update()
-
-                # Update live progress bar display
-                current_loss = batch_loss.item()
-                pbar.set_postfix({"loss": f"{current_loss:.4f}"})
-
-                if phase == "train" and (global_step + 1) % 10 == 0:
-                    _log_mean_loss(logger, running_train_loss, global_step, prefix="train/")
-                    running_train_loss = []
-
-            if phase == "valid":
-                _log_mean_loss(logger, running_val_loss, global_step, prefix="val/")
-
-                vol_dice_scores = _per_volume_dice(val_predictions,
-                                                   val_targets,
-                                                   _segmentation_dataset(val_loader).flat_index)
-                
-                mean_dice = float(np.mean(vol_dice_scores))
-                logger.log_scalar("val/dice", mean_dice, global_step)
-
-                # Checkpoint if improved
-                is_best = ""
-                if mean_dice > best_val_dice:
-                    best_val_dice = mean_dice
-                    best_epoch = epoch
-                    ckpt_path = os.path.join(cfg.checkpoint_dir, "best_model.pt")
-                    torch.save(base_model.state_dict(), ckpt_path)
-                    is_best = " (NEW BEST)"
-
-                # Print epoch summary line
-                val_loss_avg = float(np.mean(running_val_loss)) if running_val_loss else 0.0
-                train_loss_avg = float(np.mean(epoch_train_losses)) if epoch_train_losses else float("nan")
-                best_desc = f"{best_val_dice:.4f} (ep {best_epoch + 1:03d})" if best_epoch >= 0 else "n/a"
-                epoch_secs = time.perf_counter() - epoch_start
-                print(f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} | "
-                      f"train loss {train_loss_avg:.4f} | val loss {val_loss_avg:.4f} | "
-                      f"val Dice {mean_dice:.4f} | best {best_desc} | "
-                      f"lr {epoch_lr:.2e} | time {epoch_secs:.1f}s{is_best}")
-
-                with open(history_path, "a", newline="") as fp:
-                    csv.writer(fp).writerow([epoch + 1, train_loss_avg, val_loss_avg, mean_dice,
-                                             epoch_lr, epoch_secs, int(bool(is_best))])
-
-                running_val_loss = []
-        
         scheduler.step()
         logger.log_scalar("train/lr", float(scheduler.get_last_lr()[0]), global_step)
 
@@ -361,9 +341,7 @@ def run_training(cfg: argparse.Namespace) -> None:
                "train_seconds_total": elapsed,
                "seconds_per_epoch": elapsed / cfg.epochs,
                "peak_train_memory_mb": peak_mem_mb,
-               "n_params": n_params,
-               "train_patients": _segmentation_dataset(train_loader).patient_ids,
-               "val_patients": _segmentation_dataset(val_loader).patient_ids}
+               "n_params": n_params}
 
     with open(os.path.join(cfg.log_dir, "train_summary.json"), "w") as fp:
         json.dump(summary, fp, indent=2)
@@ -373,7 +351,7 @@ def run_training(cfg: argparse.Namespace) -> None:
     print(f"Training complete in {elapsed / 60:.1f} min. "
           f"Best validation Dice: {best_val_dice:.4f} ({best_epoch_desc}) -> {cfg.checkpoint_dir}/best_model.pt")
 
-    
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train U-Net for brain MRI FLAIR segmentation")
 
@@ -397,7 +375,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--context-slices", type=int, default=1,
                         help="Neighbour slices on each side given as extra input channels (2.5D); 0 = plain 2D "
                              "(default: 1)")
-    parser.add_argument("--arch", type=str, default="unet", choices=ModelFactory.available(), help="Model architecture (default: unet)")
+    parser.add_argument("--arch", type=str, default="unet", choices=available_architectures(), help="Model architecture (default: unet)")
     parser.add_argument("--seed", type=int, default=0, help="Training seed: weight init, sampling, augmentation (default: 0)")
     parser.add_argument("--fold", type=int, default=None, help="Test fold index for K-fold CV (default: None = old 100/10 split)")
     parser.add_argument("--n-folds", type=int, default=5, help="Number of CV folds (default: 5)")

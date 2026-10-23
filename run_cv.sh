@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 5-fold patient-level CV for every architecture. Safe to re-run: finished runs are skipped.
+# 5-fold patient-level CV for every architecture. Safe to re-run: finished runs are skipped, and a run whose training
+# finished (logs/train_summary.json) but whose test failed is only tested again.
 # Ends by bundling each architecture's fold models into $MODELS_DIR (export_models.py) for later prediction.
 set -euo pipefail
 
@@ -24,27 +25,24 @@ for arch in $ARCHS; do
         continue
       fi
 
-      if [ -f "$run/test_results.json" ] && [ -f "$run/checkpoints/best_model.pt" ]; then
-        # Finished before masks were saved: re-run inference only, no retraining
-        echo "[backfill] $run: saving test masks for comparison figures"
-      else
+      if [ ! -f "$run/logs/train_summary.json" ]; then
         echo "[train] $run"
-        python train.py --arch "$arch" --fold "$fold" --seed "$seed" --epochs "$EPOCHS" --compile "$COMPILE" \
+        python -m mriseg.train --arch "$arch" --fold "$fold" --seed "$seed" --epochs "$EPOCHS" --compile "$COMPILE" \
           --context-slices "$CONTEXT_SLICES" \
           --data-dir "$DATA_DIR" --checkpoint-dir "$run/checkpoints" --log-dir "$run/logs"
       fi
 
-      # --postprocess defaults to auto: chosen on this fold's validation patients, never on the test patients
+      # The checkpoint knows its fold, seed and patients. --postprocess defaults to auto: chosen on this fold's
+      # validation patients, never on the test patients
       echo "[test] $run"
-      python predict.py --arch "$arch" --fold "$fold" --seed "$seed" --split test --context-slices "$CONTEXT_SLICES" \
-        --data-dir "$DATA_DIR" --model-path "$run/checkpoints/best_model.pt" \
+      python -m mriseg.predict --model-path "$run/checkpoints/best_model.pt" --split test --data-dir "$DATA_DIR" \
         --results-json "$run/test_results.json" --figure-path "$run/dice_distribution.png" \
         --masks-npz "$run/test_masks.npz" --output-dir "$run/predictions" --skip-overlays
     done
   done
 done
 
-python aggregate.py --runs-dir "$RUNS_DIR" --baseline unet --csv "$RUNS_DIR/summary.csv"
-python compare.py --runs-dir "$RUNS_DIR" --baseline unet --out-dir "$RUNS_DIR/figures"
+python -m mriseg.aggregate --runs-dir "$RUNS_DIR" --baseline unet --csv "$RUNS_DIR/summary.csv"
+python -m mriseg.compare --runs-dir "$RUNS_DIR" --baseline unet --out-dir "$RUNS_DIR/figures"
 # shellcheck disable=SC2086  # word splitting of the list variables is intended
-python export_models.py --runs-dir "$RUNS_DIR" --out-dir "$MODELS_DIR" --archs $ARCHS --formats $EXPORT_FORMATS --overwrite
+python -m mriseg.export_models --runs-dir "$RUNS_DIR" --out-dir "$MODELS_DIR" --archs $ARCHS --formats $EXPORT_FORMATS --overwrite

@@ -1,20 +1,22 @@
 """Tests for aggregate.ResultsAggregator."""
 
 import csv
+import io
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
 import pytest
 
-from aggregate import ResultsAggregator
+from mriseg.aggregate import ResultsAggregator, print_table, write_csv
 from conftest import write_run
 
 
 def _metrics(dice: float) -> Dict[str, float]:
-    return {"dice": dice, "dice_raw": dice - 0.05, "hd95_vox": 10.0 * (1 - dice)}
+    return {"dice": dice, "dice_raw": dice - 0.05, "hd95_px": 10.0 * (1 - dice)}
 
 
 @pytest.fixture
@@ -72,12 +74,46 @@ def test_seeds_are_averaged_per_patient(runs_dir: str) -> None:
     assert agg.per_patient("unet", "dice") == {"A": pytest.approx(0.6)}
 
 
-def test_undefined_hd95_is_counted_not_averaged(runs_dir: str) -> None:
-    write_run(runs_dir, "unet", 0, 0, {"A": {"dice": 0.0, "dice_raw": 0.0, "hd95_vox": float("nan")},
-                                       "B": _metrics(0.8)})
+def test_undefined_hd95_counts_as_the_worst_value(runs_dir: str) -> None:
+    # A missed tumour has no HD95; leaving it out would make the median look better (1.5 instead of 2.0)
+    write_run(runs_dir, "unet", 0, 0, {"A": {"dice": 0.0, "dice_raw": 0.0, "hd95_px": float("nan")},
+                                       "B": _metrics(0.9), "C": _metrics(0.8)})
     row = _rows_by_arch(runs_dir)["unet"]
-    assert row["hd95_nan_count"] == 1
-    assert row["hd95_vox_median"] == pytest.approx(2.0)
+    assert row["hd95_undefined_count"] == 1
+    assert row["hd95_px_median"] == pytest.approx(2.0)
+
+
+def test_a_seed_that_missed_the_tumour_is_not_averaged_away(runs_dir: str) -> None:
+    write_run(runs_dir, "unet", 0, 0, {"A": {"dice": 0.7, "dice_raw": 0.7, "hd95_px": 4.0}})
+    write_run(runs_dir, "unet", 0, 1, {"A": {"dice": 0.0, "dice_raw": 0.0, "hd95_px": float("nan")}})
+    write_run(runs_dir, "unet", 0, 2, {"A": {"dice": 0.7, "dice_raw": 0.7, "hd95_px": 6.0}})
+    agg = ResultsAggregator(runs_dir)
+    agg.load()
+    assert agg.per_patient("unet", "hd95_px") == {"A": float("inf")}  # not 5.0
+    assert _rows_by_arch(runs_dir)["unet"]["hd95_undefined_count"] == 1
+
+
+def test_fold_spread_averages_seeds_within_each_fold_first(runs_dir: str) -> None:
+    # Fold 0: seeds score 0.5 and 0.7 (fold mean 0.6); fold 1: 0.8 for both seeds
+    write_run(runs_dir, "unet", 0, 0, {"A": _metrics(0.5)})
+    write_run(runs_dir, "unet", 0, 1, {"A": _metrics(0.7)})
+    write_run(runs_dir, "unet", 1, 0, {"B": _metrics(0.8)})
+    write_run(runs_dir, "unet", 1, 1, {"B": _metrics(0.8)})
+    row = _rows_by_arch(runs_dir)["unet"]
+    assert row["fold_mean_std"] == pytest.approx(np.std([0.6, 0.8], ddof=1))
+
+
+def test_table_prints_when_output_is_redirected_on_windows(two_arch_runs: str,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    # Redirected output on Windows (a file, a pipe, Git Bash) is written in cp1252; a character it cannot encode
+    # (it once was "Δ") crashed the table before summary.csv was written
+    agg = ResultsAggregator(two_arch_runs)
+    agg.load()
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp1252"))
+    print_table(agg.summarize("unet"), "unet")
+    sys.stdout.flush()
+    assert b"delta vs unet" in raw.getvalue()
 
 
 def test_write_csv(two_arch_runs: str, tmp_path: Path) -> None:
@@ -85,7 +121,7 @@ def test_write_csv(two_arch_runs: str, tmp_path: Path) -> None:
     agg.load()
     rows = agg.summarize("unet")
     path = tmp_path / "summary.csv"
-    ResultsAggregator.write_csv(rows, str(path))
+    write_csv(rows, str(path))
 
     with open(path, newline="") as fp:
         read = list(csv.DictReader(fp))

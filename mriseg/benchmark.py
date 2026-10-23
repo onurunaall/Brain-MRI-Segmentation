@@ -1,6 +1,6 @@
 """
 Compute benchmark: parameters, FLOPs, inference latency/throughput and peak inference memory, per backend.
-Usage: python benchmark.py --archs unet resunet swinunetr --backends pytorch fp16.engine \
+Usage: python -m mriseg.benchmark --archs unet resunet swinunetr --backends pytorch fp16.engine \
            --out ./runs/compute_benchmark.json
 Run every architecture on the SAME GPU type in ONE invocation so numbers are comparable.
 
@@ -19,10 +19,10 @@ import torch
 import torch.nn as nn
 from torch.utils.flop_counter import FlopCounterMode
 
-from dataset import MRISegmentationDataset as SegDataset
-from export_models import EXPORT_FORMATS, ModelExporter
-from inference import COMPILE_MODES, InferenceBackend, PyTorchBackend, create_backend
-from network import ModelFactory
+from mriseg.dataset import MRISegmentationDataset as SegDataset
+from mriseg.export_models import EXPORT_FORMATS, build_tensorrt_engine, export_onnx
+from mriseg.inference import COMPILE_MODES, InferenceBackend, PyTorchBackend, create_backend
+from mriseg.network import available_architectures, create_model
 
 BACKENDS: List[str] = ["pytorch"] + EXPORT_FORMATS
 
@@ -124,9 +124,9 @@ class ModelBenchmark:
         return torch.cuda.max_memory_allocated(self.device) / 2**20
 
     def run(self, arch: str, batch_sizes: List[int], backends: List[str]) -> Dict[str, Any]:
-        model = ModelFactory.create(arch,
-                                    in_channels=self.in_channels,
-                                    out_channels=SegDataset.num_output_channels)
+        model = create_model(arch,
+                             in_channels=self.in_channels,
+                             out_channels=SegDataset.num_output_channels)
         model.to(self.device).eval()
 
         per_backend: Dict[str, Dict[str, Any]] = {}
@@ -153,71 +153,71 @@ class ModelBenchmark:
         os.makedirs(arch_dir, exist_ok=True)
         precision, kind = name.split(".")
         onnx_path = os.path.join(arch_dir, f"model.{precision}.onnx")
-        ModelExporter.export_onnx(model, onnx_path, self.image_size, precision, self.in_channels)
+        export_onnx(model, onnx_path, self.image_size, precision, self.in_channels)
         if kind == "onnx":
-            return create_backend(onnx_path, arch, self.device)
+            return create_backend(onnx_path, self.device)
 
         engine_path = os.path.join(arch_dir, f"model.{precision}.engine")
-        ModelExporter.build_tensorrt_engine(onnx_path,
-                                            engine_path,
-                                            self.image_size,
-                                            max_batch=max_batch,
-                                            opt_batch=max_batch,
-                                            allow_tf32=self.allow_tf32,
-                                            workspace_gib=4.0)
-        return create_backend(engine_path, arch, self.device)
+        build_tensorrt_engine(onnx_path,
+                              engine_path,
+                              self.image_size,
+                              max_batch=max_batch,
+                              opt_batch=max_batch,
+                              allow_tf32=self.allow_tf32,
+                              workspace_gib=4.0)
+        return create_backend(engine_path, self.device)
 
-    @classmethod
-    def cli(cls) -> None:
-        parser = argparse.ArgumentParser(description="Compute benchmark for segmentation models")
-        parser.add_argument("--archs", nargs="+", default=ModelFactory.available(), choices=ModelFactory.available())
-        parser.add_argument("--backends", nargs="+", default=["pytorch"], choices=BACKENDS,
-                            help="'pytorch' and/or export formats (default: pytorch)")
-        parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 16])
-        parser.add_argument("--image-size", type=int, default=256)
-        parser.add_argument("--context-slices", type=int, default=1,
-                            help="Neighbour slices per side in the model input, as train.py (default: 1)")
-        parser.add_argument("--warmup-iters", type=int, default=20)
-        parser.add_argument("--timed-iters", type=int, default=100)
-        parser.add_argument("--no-amp", action="store_true",
-                            help="Disable fp16 autocast of the 'pytorch' backend (default: AMP on, as in training)")
-        parser.add_argument("--compile", type=str, nargs="?", const="default", default="none", choices=COMPILE_MODES,
-                            help="torch.compile mode of the 'pytorch' backend; '--compile' alone means 'default'")
-        parser.add_argument("--no-tf32", action="store_true", help="Disable TF32 in fp32 TensorRT engines")
-        parser.add_argument("--export-dir", type=str, default="./benchmark_exports",
-                            help="Where ONNX files and TensorRT engines for the benchmark are written")
-        parser.add_argument("--device", type=str, default="cuda:0")
-        parser.add_argument("--out", type=str, default="./compute_benchmark.json")
-        args = parser.parse_args()
 
-        device = torch.device("cpu" if not torch.cuda.is_available() else args.device)
-        bench = cls(device, args.image_size, args.warmup_iters, args.timed_iters,
-                    use_amp=not args.no_amp, compile_mode=args.compile, export_dir=args.export_dir,
-                    allow_tf32=not args.no_tf32, context_slices=args.context_slices)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Compute benchmark for segmentation models")
+    parser.add_argument("--archs", nargs="+", default=available_architectures(), choices=available_architectures())
+    parser.add_argument("--backends", nargs="+", default=["pytorch"], choices=BACKENDS,
+                        help="'pytorch' and/or export formats (default: pytorch)")
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 16])
+    parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--context-slices", type=int, default=1,
+                        help="Neighbour slices per side in the model input, as train.py (default: 1)")
+    parser.add_argument("--warmup-iters", type=int, default=20)
+    parser.add_argument("--timed-iters", type=int, default=100)
+    parser.add_argument("--no-amp", action="store_true",
+                        help="Disable fp16 autocast of the 'pytorch' backend (default: AMP on, as in training)")
+    parser.add_argument("--compile", type=str, nargs="?", const="default", default="none", choices=COMPILE_MODES,
+                        help="torch.compile mode of the 'pytorch' backend; '--compile' alone means 'default'")
+    parser.add_argument("--no-tf32", action="store_true", help="Disable TF32 in fp32 TensorRT engines")
+    parser.add_argument("--export-dir", type=str, default="./benchmark_exports",
+                        help="Where ONNX files and TensorRT engines for the benchmark are written")
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--out", type=str, default="./compute_benchmark.json")
+    args = parser.parse_args()
 
-        env: Dict[str, Any] = {"device": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
-                               "torch": torch.__version__,
-                               "amp": bench.use_amp,
-                               "compile": args.compile,
-                               "image_size": args.image_size,
-                               "context_slices": args.context_slices,
-                               "notes": ["'amp' and 'compile' apply to the 'pytorch' backend only",
-                                         "peak_inference_memory_mb counts PyTorch's allocator only, so it is "
-                                         "reported for the 'pytorch' backend only",
-                                         "onnx latencies include host<->device copies (ONNX Runtime reads numpy "
-                                         "arrays)"]}
-        if any(name.endswith(".engine") for name in args.backends):
-            import tensorrt as trt
+    device = torch.device("cpu" if not torch.cuda.is_available() else args.device)
+    bench = ModelBenchmark(device, args.image_size, args.warmup_iters, args.timed_iters,
+                           use_amp=not args.no_amp, compile_mode=args.compile, export_dir=args.export_dir,
+                           allow_tf32=not args.no_tf32, context_slices=args.context_slices)
 
-            env["tensorrt"] = trt.__version__
-            env["tensorrt_tf32"] = not args.no_tf32
+    env: Dict[str, Any] = {"device": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+                           "torch": torch.__version__,
+                           "amp": bench.use_amp,
+                           "compile": args.compile,
+                           "image_size": args.image_size,
+                           "context_slices": args.context_slices,
+                           "notes": ["'amp' and 'compile' apply to the 'pytorch' backend only",
+                                     "peak_inference_memory_mb counts PyTorch's allocator only, so it is "
+                                     "reported for the 'pytorch' backend only",
+                                     "onnx latencies include host<->device copies (ONNX Runtime reads numpy "
+                                     "arrays)"]}
+    if any(name.endswith(".engine") for name in args.backends):
+        import tensorrt as trt
 
-        results = [bench.run(arch, args.batch_sizes, args.backends) for arch in args.archs]
+        env["tensorrt"] = trt.__version__
+        env["tensorrt_tf32"] = not args.no_tf32
 
-        with open(args.out, "w") as fp:
-            json.dump({"env": env, "results": results}, fp, indent=2)
-        print(f"[Benchmark] wrote {args.out}")
+    results = [bench.run(arch, args.batch_sizes, args.backends) for arch in args.archs]
+
+    with open(args.out, "w") as fp:
+        json.dump({"env": env, "results": results}, fp, indent=2)
+    print(f"[Benchmark] wrote {args.out}")
 
 
 if __name__ == "__main__":
-    ModelBenchmark.cli()
+    main()

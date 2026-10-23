@@ -1,24 +1,14 @@
-"""Tests for evaluation.PatientEvaluator."""
+"""Tests for the evaluation module: grid Dice for training, original-pixel scores for reporting."""
 
 import json
 import math
 from pathlib import Path
-from typing import Tuple
 
 import numpy as np
 import pytest
 
-from evaluation import PatientEvaluator
-
-
-def test_strip_compile_prefix() -> None:
-    state = {"_orig_mod.enc1.weight": 1, "_orig_mod.head.bias": 2}
-    assert dict(PatientEvaluator.strip_compile_prefix(state)) == {"enc1.weight": 1, "head.bias": 2}
-
-
-def test_strip_compile_prefix_is_noop_without_prefix() -> None:
-    state = {"enc1.weight": 1}
-    assert dict(PatientEvaluator.strip_compile_prefix(state)) == state
+from mriseg.evaluation import hd95_px, raw_dice_per_patient, score_patient, write_results
+from mriseg.utils import VolumeGeometry
 
 
 def test_raw_dice_per_patient_groups_slices_by_patient() -> None:
@@ -34,10 +24,16 @@ def test_raw_dice_per_patient_groups_slices_by_patient() -> None:
     targets = [gt_a, gt_a, gt_b]
     flat_index = [(0, 0), (0, 1), (1, 0)]
 
-    scores = PatientEvaluator.raw_dice_per_patient(preds, targets, flat_index, ["A", "B"])
+    scores = raw_dice_per_patient(preds, targets, flat_index, ["A", "B"])
 
     assert scores["A"] == pytest.approx(1.0)
     assert scores["B"] == pytest.approx(0.5, abs=1e-6)
+
+
+def test_raw_dice_rejects_slices_in_the_wrong_order() -> None:
+    gt = np.zeros((1, 4, 4), dtype=np.float32)
+    with pytest.raises(ValueError, match="out of order"):
+        raw_dice_per_patient([gt, gt], [gt, gt], [(0, 1), (0, 0)], ["A"])
 
 
 def test_raw_dice_keeps_stray_components() -> None:
@@ -46,44 +42,59 @@ def test_raw_dice_keeps_stray_components() -> None:
     gt[0, 1:3, 1:3] = 1
     pred = gt.copy()
     pred[0, 7, 7] = 1
-    scores = PatientEvaluator.raw_dice_per_patient([pred], [gt], [(0, 0)], ["A"])
+    scores = raw_dice_per_patient([pred], [gt], [(0, 0)], ["A"])
     assert scores["A"] == pytest.approx(2 * 4 / (5 + 4), abs=1e-6)
 
 
-def _volume(pred: np.ndarray, gt: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(input, pred, gt) tuple with the (Z, 1, H, W) layout predict.py builds."""
-    return (np.zeros((pred.shape[0], 3) + pred.shape[1:]), pred[:, None], gt[:, None])
+def _geometry(n_slices: int, size: int, z_start: int = 0) -> VolumeGeometry:
+    """Geometry of a scan whose grid is its crop: no resizing, only (optionally) dropped end slices."""
+    return VolumeGeometry(n_slices=n_slices, height=size, width=size, z_start=z_start, y_start=0, x_start=0,
+                          crop_slices=n_slices - 2 * z_start, crop_height=size, crop_width=size, grid_size=size)
 
 
 def test_hd95_edge_cases() -> None:
-    empty = np.zeros((2, 8, 8), dtype=np.float32)
+    empty = np.zeros((2, 8, 8), dtype=bool)
     blob = empty.copy()
-    blob[1, 2:5, 2:5] = 1
+    blob[1, 2:5, 2:5] = True
 
-    scores = PatientEvaluator.hd95_per_patient({"both_empty": _volume(empty, empty),
-                                                "missed": _volume(empty, blob),
-                                                "false_alarm": _volume(blob, empty),
-                                                "identical": _volume(blob, blob)})
-
-    assert scores["both_empty"] == 0.0
-    assert math.isnan(scores["missed"])
-    assert math.isnan(scores["false_alarm"])
-    assert scores["identical"] == pytest.approx(0.0)
+    assert hd95_px(empty, empty) == 0.0
+    assert math.isnan(hd95_px(empty, blob))  # missed
+    assert math.isnan(hd95_px(blob, empty))  # false alarm
+    assert hd95_px(blob, blob) == pytest.approx(0.0)
 
 
 def test_hd95_shifted_mask_is_positive() -> None:
-    gt = np.zeros((1, 12, 12), dtype=np.float32)
-    gt[0, 2:6, 2:6] = 1
-    pred = np.roll(gt, 4, axis=2)
-    score = PatientEvaluator.hd95_per_patient({"p": _volume(pred, gt)})["p"]
-    assert 0.0 < score <= 4.0 + 1e-6
+    gt = np.zeros((1, 12, 12), dtype=bool)
+    gt[0, 2:6, 2:6] = True
+    assert 0.0 < hd95_px(np.roll(gt, 4, axis=2), gt) <= 4.0 + 1e-6
+
+
+def test_score_patient_applies_the_postprocessing_only_to_dice() -> None:
+    gt = np.zeros((3, 12, 12), dtype=bool)
+    gt[0:2, 1:5, 1:5] = True                  # 32-voxel tumour
+    probability = gt * 0.9
+    probability[2, 10, 10] = 0.9              # one false-positive voxel elsewhere
+
+    scores = score_patient(probability, _geometry(3, 12), gt, "lcc")
+    assert scores["dice"] == pytest.approx(1.0)                      # lcc removed the stray voxel
+    assert scores["dice_raw"] == pytest.approx(2 * 32 / 65, abs=1e-6)  # without post-processing it counts
+    assert scores["hd95_px"] == pytest.approx(0.0)
+
+
+def test_score_patient_counts_tumour_on_slices_the_model_never_saw() -> None:
+    # The first and last slice are dropped by preprocessing; tumour there is missed, not ignored
+    gt = np.zeros((5, 8, 8), dtype=bool)
+    gt[:, 2:6, 2:6] = True
+    perfect_on_grid = gt[1:-1].astype(np.float32)
+    scores = score_patient(perfect_on_grid, _geometry(5, 8, z_start=1), gt, "none")
+    assert scores["dice"] == pytest.approx(2 * 48 / (48 + 80), abs=1e-6)
 
 
 def test_write_results_schema(tmp_path: Path) -> None:
     path = tmp_path / "res.json"
     meta = {"arch": "unet", "fold": 0}
-    PatientEvaluator.write_results(str(path), meta, {"A": 0.9}, {"A": 0.85}, {"A": 3.0})
+    per_patient = {"A": {"dice": 0.9, "dice_raw": 0.85, "hd95_px": 3.0}}
+    write_results(str(path), meta, per_patient)
 
     data = json.loads(path.read_text())
-    assert data["meta"] == meta
-    assert data["per_patient"] == {"A": {"dice": 0.9, "dice_raw": 0.85, "hd95_vox": 3.0}}
+    assert data == {"meta": meta, "per_patient": per_patient}
