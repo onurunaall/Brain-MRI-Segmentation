@@ -1,2 +1,23 @@
 __pycache__/
 *.pyc
+
+# Environments and tool caches
+.venv/
+.cache/
+.mypy_cache/
+.pytest_cache/
+
+# Dataset and everything the pipeline writes (see README / docs/usage.md)
+kaggle_3m/
+runs/
+runs_*/
+models/
+models_*/
+checkpoints/
+tb_logs/
+predictions/
+/dice_distribution.png
+*.pt
+*.onnx
+*.engine
+*.plan

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Test-set evaluation of every CV fold model under other inference backends, to measure how much torch.compile,
-# ONNX Runtime and TensorRT (fp32 / fp16) change the results compared with eager PyTorch (test_results.json).
+# fp16 autocast, ONNX Runtime and TensorRT (fp32 / fp16) change the results compared with eager PyTorch
+# (test_results.json).
 # Run after run_cv.sh with the formats exported, e.g. EXPORT_FORMATS="fp32.onnx fp16.onnx fp32.engine fp16.engine".
 # Writes <run>/test_results.<variant>.json and $RUNS_DIR/summary.<variant>.csv. Safe to re-run: finished runs are skipped.
 set -euo pipefail
@@ -8,7 +9,8 @@ set -euo pipefail
 ARCHS=${ARCHS:-"unet resunet swinunetr"}
 FOLDS=${FOLDS:-"0 1 2 3 4"}
 SEEDS=${SEEDS:-"0 1 2"}
-VARIANTS=${VARIANTS:-"compile fp32.onnx fp16.onnx fp32.engine fp16.engine"}  # "compile" = model.pt + torch.compile
+# "compile" = model.pt + torch.compile, "amp" = model.pt + fp16 autocast, the rest = exported files
+VARIANTS=${VARIANTS:-"compile amp fp32.onnx fp16.onnx fp32.engine fp16.engine"}
 DATA_DIR=${DATA_DIR:-./kaggle_3m}
 RUNS_DIR=${RUNS_DIR:-./runs}
 MODELS_DIR=${MODELS_DIR:-./models}
@@ -29,6 +31,8 @@ for variant in $VARIANTS; do
         # Exported files take their training record (fold, patients, input size) from the model.pt next to them
         if [ "$variant" = "compile" ]; then
           model_args=(--model-path "$member/model.pt" --compile default)
+        elif [ "$variant" = "amp" ]; then
+          model_args=(--model-path "$member/model.pt" --amp)
         else
           model_args=(--model-path "$member/model.$variant")
         fi
