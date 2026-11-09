@@ -27,16 +27,10 @@ class UNetModel(nn.Module):
 
         # Encoder path
         self.enc_block1 = self._conv_block(in_channels, f, tag="e1")
-        self.downsample1 = nn.MaxPool2d(kernel_size=2, stride=2)
-
         self.enc_block2 = self._conv_block(f, f * 2, tag="e2")
-        self.downsample2 = nn.MaxPool2d(kernel_size=2, stride=2)
-
         self.enc_block3 = self._conv_block(f * 2, f * 4, tag="e3")
-        self.downsample3 = nn.MaxPool2d(kernel_size=2, stride=2)
-
         self.enc_block4 = self._conv_block(f * 4, f * 8, tag="e4")
-        self.downsample4 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
         # Bridge
         self.bridge = self._conv_block(f * 8, f * 16, tag="bridge")
@@ -66,29 +60,18 @@ class UNetModel(nn.Module):
         """
         # Encoder
         e1 = self.enc_block1(x)
-        e2 = self.enc_block2(self.downsample1(e1))
-        e3 = self.enc_block3(self.downsample2(e2))
-        e4 = self.enc_block4(self.downsample3(e3))
+        e2 = self.enc_block2(self.pool(e1))
+        e3 = self.enc_block3(self.pool(e2))
+        e4 = self.enc_block4(self.pool(e3))
 
         # Bridge
-        latent = self.bridge(self.downsample4(e4))
+        latent = self.bridge(self.pool(e4))
 
         # Decoder with skip connections
-        d4 = self.upsample4(latent)
-        d4 = torch.cat((d4, e4), dim=1)
-        d4 = self.dec_block4(d4)
-
-        d3 = self.upsample3(d4)
-        d3 = torch.cat((d3, e3), dim=1)
-        d3 = self.dec_block3(d3)
-
-        d2 = self.upsample2(d3)
-        d2 = torch.cat((d2, e2), dim=1)
-        d2 = self.dec_block2(d2)
-
-        d1 = self.upsample1(d2)
-        d1 = torch.cat((d1, e1), dim=1)
-        d1 = self.dec_block1(d1)
+        d4 = self.dec_block4(torch.cat((self.upsample4(latent), e4), dim=1))
+        d3 = self.dec_block3(torch.cat((self.upsample3(d4), e3), dim=1))
+        d2 = self.dec_block2(torch.cat((self.upsample2(d3), e2), dim=1))
+        d1 = self.dec_block1(torch.cat((self.upsample1(d2), e1), dim=1))
 
         return self.head(d1)
 
@@ -255,7 +238,7 @@ class _SwinBlock(nn.Module):
                 cnt += 1
         ids = _SwinBlock.window_partition(region, ws).squeeze(-1)
         mask = ids.unsqueeze(1) - ids.unsqueeze(2)
-        return mask.masked_fill(mask != 0, -100.0).masked_fill(mask == 0, 0.0)
+        return mask.masked_fill(mask != 0, -100.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, h, w, c = x.shape

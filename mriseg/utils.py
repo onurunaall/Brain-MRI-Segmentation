@@ -15,16 +15,14 @@ import torch.nn.functional as F
 
 
 def dice_similarity_coefficient(prediction: npt.NDArray,
-                                ground_truth: npt.NDArray,
-                                epsilon: float = 1e-6) -> float:
+                                ground_truth: npt.NDArray) -> float:
     """
     Dice Similarity Coefficient (DSC) between two masks, each binarized at 0.5 (values of exactly 0.5 count as
     background). It applies no post-processing; filter the prediction with postprocess_mask first if needed.
 
     :param prediction: Predicted mask or probabilities
     :param ground_truth: Ground truth mask
-    :param epsilon: Small constant for numerical stability
-    :return: Dice coefficient in range [0.0, 1.0]
+    :return: Dice coefficient in range [0.0, 1.0]; exactly 0.0 without overlap
     """
     prediction = np.asarray(prediction) > 0.5
     ground_truth = np.asarray(ground_truth) > 0.5
@@ -36,7 +34,7 @@ def dice_similarity_coefficient(prediction: npt.NDArray,
     if total == 0:
         return 1.0
 
-    return float((2.0 * overlap + epsilon) / (total + epsilon))
+    return 2.0 * overlap / total
 
 
 def group_slices_by_patient(slices: Sequence[npt.NDArray],
@@ -273,40 +271,41 @@ def compose_visualization(mri_slice: torch.Tensor,
     :param channel_idx: Which MRI channel to display (default 1 = FLAIR)
     :return: List of RGB overlay images as uint8 arrays
     """
-    overlays: List[npt.NDArray[np.uint8]] = []
+    images = mri_slice[:, channel_idx].cpu().numpy()
+    ground_truths = gt_mask[:, 0].cpu().numpy()
+    predictions = pred_mask[:, 0].cpu().numpy()
+    return [contour_overlay(image, prediction, ground_truth)
+            for image, prediction, ground_truth in zip(images, predictions, ground_truths)]
 
-    input_np = mri_slice[:, channel_idx].cpu().numpy()
-    gt_np = gt_mask[:, 0].cpu().numpy()
-    pred_np = pred_mask[:, 0].cpu().numpy()
 
-    for i in range(input_np.shape[0]):
-        rgb = grayscale_to_rgb(np.squeeze(input_np[i]))
-        rgb = draw_contour(rgb, pred_np[i], color=[255, 0, 0])   # red = prediction
-        rgb = draw_contour(rgb, gt_np[i], color=[0, 255, 0])     # green = ground truth
-        overlays.append(rgb)
+def contour_overlay(image: npt.NDArray,
+                    prediction: npt.NDArray,
+                    ground_truth: npt.NDArray) -> npt.NDArray[np.uint8]:
+    """
+    A grayscale slice as RGB with the prediction (red) and ground truth (green) contours drawn on it.
 
-    return overlays
+    :param image: 2D grayscale array
+    :param prediction: 2D predicted mask or probabilities
+    :param ground_truth: 2D ground-truth mask
+    :return: RGB array of shape (H, W, 3) with dtype uint8
+    """
+    rgb = draw_contour(grayscale_to_rgb(image), prediction, color=[255, 0, 0])
+    return draw_contour(rgb, ground_truth, color=[0, 255, 0])
 
 
 def grayscale_to_rgb(image: npt.NDArray[np.float64]) -> npt.NDArray[np.uint8]:
     """
-    Convert a single-channel grayscale image to 3-channel RGB (uint8).
+    Convert a single-channel grayscale image to 3-channel RGB (uint8), min-max scaled to 0-255.
 
     :param image: 2D grayscale array
     :return: RGB array of shape (H, W, 3) with dtype uint8
     """
-    h, w = image.shape
-
-    # Shift to non-negative range
-    image = image + np.abs(np.min(image))
-    peak = np.abs(np.max(image))
+    image = image - image.min()
+    peak = image.max()
     if peak > 0:
         image = image / peak
-
-    rgb = np.empty((h, w, 3), dtype=np.uint8)
-    rgb[:, :, 0] = rgb[:, :, 1] = rgb[:, :, 2] = (image * 255).astype(np.uint8)
-
-    return rgb
+    gray = (image * 255).astype(np.uint8)
+    return np.repeat(gray[..., np.newaxis], 3, axis=-1)
 
 
 def draw_contour(image: npt.NDArray[np.uint8],

@@ -116,19 +116,8 @@ class RandomScale:
                          interpolation=TF.InterpolationMode.NEAREST_EXACT,
                          antialias=False)
 
-        if factor < 1.0:
-            pad_h = orig_h - new_h
-            pad_w = orig_w - new_w
-            pad_top = pad_h // 2
-            pad_left = pad_w // 2
-            padding = [pad_left, pad_top, pad_w - pad_left, pad_h - pad_top]
-            image = TF.pad(image, padding, fill=0)
-            mask = TF.pad(mask, padding, fill=0)
-        else:
-            image = TF.center_crop(image, [orig_h, orig_w])
-            mask = TF.center_crop(mask, [orig_h, orig_w])
-
-        return image, mask
+        # center_crop pads with 0 (the background) where the shrunk image is smaller than the original size
+        return TF.center_crop(image, [orig_h, orig_w]), TF.center_crop(mask, [orig_h, orig_w])
 
 
 class RandomRotation:

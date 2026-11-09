@@ -26,8 +26,8 @@ from tqdm import tqdm
 from mriseg.dataset import MRISegmentationDataset as SegDataset, find_patients
 from mriseg.evaluation import score_patient, write_results
 from mriseg.inference import COMPILE_MODES, InferenceBackend, create_backend, load_bundle, model_record
-from mriseg.utils import (POSTPROCESS_METHODS, VolumeGeometry, dice_similarity_coefficient, draw_contour,
-                          grayscale_to_rgb, group_slices_by_patient, postprocess_mask, restore_mask_geometry)
+from mriseg.utils import (POSTPROCESS_METHODS, VolumeGeometry, contour_overlay, dice_similarity_coefficient,
+                          group_slices_by_patient, postprocess_mask, restore_mask_geometry)
 
 Volumes = Dict[str, np.ndarray]  # patient_id -> (Z, H, W) array on the preprocessed grid
 
@@ -294,10 +294,8 @@ def _save_overlays(output_dir: str, flair: Volumes, masks: Volumes, targets: Vol
     """One PNG per slice: FLAIR with the prediction (red) and ground truth (green) contours."""
     for pid in masks:
         for s in range(len(masks[pid])):
-            rgb = grayscale_to_rgb(flair[pid][s])
-            rgb = draw_contour(rgb, masks[pid][s], color=[255, 0, 0])   # red = prediction
-            rgb = draw_contour(rgb, targets[pid][s], color=[0, 255, 0])  # green = ground truth
-            imsave(os.path.join(output_dir, f"{pid}-{s:02d}.png"), rgb)
+            imsave(os.path.join(output_dir, f"{pid}-{s:02d}.png"),
+                   contour_overlay(flair[pid][s], masks[pid][s], targets[pid][s]))
 
 
 def _plot_dice_distribution(dice_scores: Dict[str, float], path: str) -> None:

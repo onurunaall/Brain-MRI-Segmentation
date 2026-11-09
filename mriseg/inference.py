@@ -139,18 +139,20 @@ class OnnxRuntimeBackend(InferenceBackend):
     def __init__(self, onnx_path: str, device: torch.device) -> None:
         """
         :param onnx_path: Model exported by export_models.py (fp32 or fp16 input)
-        :param device: Requested device; falls back to CPU if onnxruntime-gpu is not installed
+        :param device: Requested device; falls back to CPU if ONNX Runtime cannot use CUDA
         """
         import onnxruntime as ort  # optional dependency: uv sync --group onnx
 
         providers: List[Any] = ["CPUExecutionProvider"]
         if device.type == "cuda":
-            if "CUDAExecutionProvider" in ort.get_available_providers():
-                providers.insert(0, ("CUDAExecutionProvider", {"device_id": device.index or 0}))
-            else:
-                print("[ONNX Runtime] CUDAExecutionProvider not available (needs onnxruntime-gpu); running on CPU")
-
+            providers.insert(0, ("CUDAExecutionProvider", {"device_id": device.index or 0}))
         self.session = ort.InferenceSession(onnx_path, providers=providers)
+
+        # ONNX Runtime falls back to CPU when the CUDA provider fails to load, e.g. onnxruntime-gpu built for another
+        # CUDA version than PyTorch's; get_available_providers() still lists it then
+        if device.type == "cuda" and "CUDAExecutionProvider" not in self.session.get_providers():
+            print("[ONNX Runtime] CUDAExecutionProvider could not be used (needs onnxruntime-gpu built for PyTorch's "
+                  "CUDA version, see the ONNX Runtime error above); running on CPU")
         model_input = self.session.get_inputs()[0]
         self.input_name: str = model_input.name
         self.input_dtype: npt.DTypeLike = np.float16 if model_input.type == "tensor(float16)" else np.float32
@@ -244,10 +246,7 @@ class EnsembleBackend(InferenceBackend):
         self.members = list(members)
 
     def predict(self, images: torch.Tensor) -> torch.Tensor:
-        total = self.members[0].predict(images)
-        for member in self.members[1:]:
-            total = total + member.predict(images)
-        return total / len(self.members)
+        return torch.stack([member.predict(images) for member in self.members]).mean(dim=0)
 
 
 def create_backend(model_path: str,

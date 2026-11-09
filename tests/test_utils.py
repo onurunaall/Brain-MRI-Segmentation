@@ -22,7 +22,7 @@ class TestDiceSimilarityCoefficient:
         gt = np.zeros((1, 8, 8), dtype=np.float32)
         pred[0, 0:2, 0:2] = 1
         gt[0, 5:7, 5:7] = 1
-        assert dice_similarity_coefficient(pred, gt) == pytest.approx(0.0, abs=1e-6)
+        assert dice_similarity_coefficient(pred, gt) == 0.0  # exactly 0, not a tiny epsilon / total
 
     def test_known_partial_overlap(self) -> None:
         # |P| = 2, |G| = 2, |P ∩ G| = 1  ->  Dice = 2*1 / (2+2) = 0.5

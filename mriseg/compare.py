@@ -14,7 +14,7 @@ import math
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Protocol, Tuple, TypeVar, Union
 
 import matplotlib
 matplotlib.use("Agg")
@@ -36,8 +36,25 @@ GALLERY_COLUMNS = 10
 PROBABILITY_CMAP = "magma"
 GT_OUTLINE_COLOR = "cyan"
 
-# (patient id, mean Dice over architectures, FLAIR, ground truth, prediction per arch, Dice per arch, shown slice)
-OverviewEntry = Tuple[str, float, np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[str, float], int]
+class ScoredPatient(Protocol):
+    """A patient ranked by Dice in a figure (GalleryEntry, OverviewEntry)."""
+    pid: str
+    dice: float
+
+
+Scored = TypeVar("Scored", bound=ScoredPatient)
+
+
+@dataclass
+class OverviewEntry:
+    """One test patient of the overview figure, with the predictions of every architecture."""
+    pid: str
+    dice: float  # mean patient Dice over the architectures
+    flair: np.ndarray
+    gt: np.ndarray
+    preds: Dict[str, np.ndarray]
+    arch_dice: Dict[str, float]
+    slice_index: int
 
 
 @dataclass
@@ -96,6 +113,10 @@ class ComparisonPlotter:
     def _per_patient(self, arch: str, metric: str) -> Dict[str, float]:
         """Metric per patient averaged over seeds (each patient is tested in exactly one fold)."""
         return mean_per_patient((run.results for run in self.runs if run.arch == arch), metric)
+
+    def _folds(self) -> List[Optional[int]]:
+        """Fold indices of the runs in ascending order, runs without a fold last."""
+        return sorted({r.fold for r in self.runs}, key=lambda f: (f is None, f))
 
     def _mask_run(self, arch: str, fold: Optional[int]) -> Optional[RunRecord]:
         """Run whose masks represent (arch, fold): the requested seed, else the lowest available seed."""
@@ -276,9 +297,11 @@ class ComparisonPlotter:
     # ------------------------------------------------------ segmentation grids
 
     @staticmethod
-    def _overlay(flair: np.ndarray, gt: np.ndarray, pred: Optional[np.ndarray]) -> np.ndarray:
-        """RGB image: FLAIR with GT filled (pred=None) or with TP/FP/FN coloured."""
+    def _overlay(flair: np.ndarray, gt: Optional[np.ndarray] = None, pred: Optional[np.ndarray] = None) -> np.ndarray:
+        """RGB image: FLAIR alone, with GT filled (pred=None) or with TP/FP/FN coloured."""
         base = np.repeat((flair.astype(np.float32) / 255.0)[..., None], 3, axis=2)
+        if gt is None:
+            return base
         gt = gt.astype(bool)
         if pred is None:
             layers = [(gt, GT_COLOR)]
@@ -364,7 +387,7 @@ class ComparisonPlotter:
         overview: List[OverviewEntry] = []
         n_written = 0
 
-        for fold in sorted({r.fold for r in self.runs}, key=lambda f: (f is None, f)):
+        for fold in self._folds():
             flair_gt, preds, dice = self._load_fold_masks(fold)
             for pid in sorted(flair_gt):
                 if max_patients is not None and n_written >= max_patients:
@@ -382,7 +405,13 @@ class ComparisonPlotter:
                 n_written += 1
 
                 mean_dice = np.nanmean([arch_dice[a] for a in archs]) if archs else np.nan
-                overview.append((pid, float(mean_dice), flair, gt, arch_preds, arch_dice, picks[0][0]))
+                overview.append(OverviewEntry(pid=pid,
+                                              dice=float(mean_dice),
+                                              flair=flair,
+                                              gt=gt,
+                                              preds=arch_preds,
+                                              arch_dice=arch_dice,
+                                              slice_index=picks[0][0]))
 
         if n_written == 0:
             print("[Compare] skip segmentation grids: no test_masks.npz found (re-run predict.py with --masks-npz)")
@@ -397,8 +426,8 @@ class ComparisonPlotter:
         fig, axes = plt.subplots(len(picks), n_cols, figsize=(2.6 * n_cols, 2.8 * len(picks) + 0.8), squeeze=False)
 
         for row, (s, why) in enumerate(picks):
-            panels = [("FLAIR", self._overlay(flair[s], np.zeros_like(gt[s]), None)),
-                      ("Ground truth", self._overlay(flair[s], gt[s], None))]
+            panels = [("FLAIR", self._overlay(flair[s])),
+                      ("Ground truth", self._overlay(flair[s], gt[s]))]
             for arch in archs:
                 sd = self._slice_dice(arch_preds[arch][s].astype(bool), gt[s].astype(bool))
                 sd_txt = "n/a (both empty)" if sd is None else f"{sd:.3f}"
@@ -423,29 +452,20 @@ class ComparisonPlotter:
 
     def _draw_overview(self, overview: List[OverviewEntry], n_each: int = 2) -> None:
         """Best / median / worst patients (by mean Dice over architectures) on their largest-tumour slice."""
-        ranked = sorted([o for o in overview if not np.isnan(o[1])], key=lambda o: o[1])
-        if not ranked:
+        rows = self._worst_median_best(sorted(overview, key=self._dice_rank_key), n_each)
+        if not rows:
             return
-        mid = len(ranked) // 2
-        chosen = [("worst", o) for o in ranked[:n_each]]
-        chosen += [("median", o) for o in ranked[max(0, mid - n_each // 2): mid - n_each // 2 + n_each]]
-        chosen += [("best", o) for o in ranked[-n_each:]]
-        seen, rows = set(), []
-        for label, o in chosen:
-            if o[0] not in seen:
-                seen.add(o[0])
-                rows.append((label, o))
 
         n_cols = 2 + len(self.archs)
         fig, axes = plt.subplots(len(rows), n_cols, figsize=(2.6 * n_cols, 2.7 * len(rows) + 0.8), squeeze=False)
-        for r, (label, (pid, mean_dice, flair, gt, arch_preds, arch_dice, s)) in enumerate(rows):
-            panels: List[Tuple[str, Optional[np.ndarray]]] = [
-                ("FLAIR", self._overlay(flair[s], np.zeros_like(gt[s]), None)),
-                ("Ground truth", self._overlay(flair[s], gt[s], None))]
+        for r, (label, entry) in enumerate(rows):
+            flair, gt, s = entry.flair, entry.gt, entry.slice_index
+            panels: List[Tuple[str, Optional[np.ndarray]]] = [("FLAIR", self._overlay(flair[s])),
+                                                               ("Ground truth", self._overlay(flair[s], gt[s]))]
             for arch in self.archs:
-                if arch in arch_preds:
-                    panels.append((f"{arch}: {arch_dice[arch]:.3f}",
-                                   self._overlay(flair[s], gt[s], arch_preds[arch][s])))
+                if arch in entry.preds:
+                    panels.append((f"{arch}: {entry.arch_dice[arch]:.3f}",
+                                   self._overlay(flair[s], gt[s], entry.preds[arch][s])))
                 else:
                     panels.append((f"{arch}: no masks", None))
             for c, (title, img) in enumerate(panels):
@@ -455,7 +475,7 @@ class ComparisonPlotter:
                 ax.set_xticks([])
                 ax.set_yticks([])
                 ax.set_title(title, fontsize=8)
-            axes[r, 0].set_ylabel(f"{label}\n{pid}\nslice {s}", fontsize=7)
+            axes[r, 0].set_ylabel(f"{label}\n{entry.pid}\nslice {s}", fontsize=7)
 
         fig.suptitle("Worst / median / best test patients (ranked by mean patient Dice over architectures)", fontsize=10)
         fig.legend(handles=_legend_handles(), loc="lower center", ncol=4, fontsize=8, frameon=False)
@@ -491,8 +511,7 @@ class ComparisonPlotter:
     def _gallery_entries(self, arch: str) -> List[GalleryEntry]:
         """Every test patient of `arch` that has masks, scored with the Dice of the run whose masks are drawn."""
         entries: List[GalleryEntry] = []
-        folds = sorted({r.fold for r in self.runs}, key=lambda f: (f is None, f))
-        for fold in folds:
+        for fold in self._folds():
             run = self._mask_run(arch, fold)
             if run is None:
                 continue
@@ -511,12 +530,12 @@ class ComparisonPlotter:
         return entries
 
     @staticmethod
-    def _dice_rank_key(entry: GalleryEntry) -> Tuple[bool, float]:
+    def _dice_rank_key(entry: ScoredPatient) -> Tuple[bool, float]:
         """Sort key: ascending Dice, patients without a Dice value last."""
         return math.isnan(entry.dice), entry.dice
 
     @staticmethod
-    def _worst_median_best(ranked: List[GalleryEntry], n: int) -> List[Tuple[str, GalleryEntry]]:
+    def _worst_median_best(ranked: List[Scored], n: int) -> List[Tuple[str, Scored]]:
         """(label, entry) for the n lowest, n middle and n highest Dice patients; each patient appears once."""
         scored = [entry for entry in ranked if not math.isnan(entry.dice)]
         middle_start = max(0, (len(scored) - n) // 2)
@@ -524,7 +543,7 @@ class ComparisonPlotter:
                   ("median", scored[middle_start: middle_start + n]),
                   ("best", scored[::-1][:n])]
 
-        chosen: List[Tuple[str, GalleryEntry]] = []
+        chosen: List[Tuple[str, Scored]] = []
         seen = set()
         for label, group in groups:
             for rank, entry in enumerate(group, start=1):
@@ -566,8 +585,8 @@ class ComparisonPlotter:
 
         heatmap = None
         for row, (s, why) in enumerate(picks):
-            axes[row, 0].imshow(self._overlay(flair[s], np.zeros_like(gt[s]), None))
-            axes[row, 1].imshow(self._overlay(flair[s], gt[s], None))
+            axes[row, 0].imshow(self._overlay(flair[s]))
+            axes[row, 1].imshow(self._overlay(flair[s], gt[s]))
             axes[row, 2].imshow(self._overlay(flair[s], gt[s], pred[s]))
             self._label_slice_dice(axes[row, 2], pred[s], gt[s])
             if probability is not None:

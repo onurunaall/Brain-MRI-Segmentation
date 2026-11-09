@@ -109,11 +109,12 @@ def train_one_epoch(model: nn.Module,
         scaler.step(optimizer)
         scaler.update()
 
-        epoch_losses.append(loss.item())
-        recent_losses.append(loss.item())
-        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        loss_value = loss.item()
+        epoch_losses.append(loss_value)
+        recent_losses.append(loss_value)
+        pbar.set_postfix({"loss": f"{loss_value:.4f}"})
 
-        if (global_step + 1) % 10 == 0:
+        if global_step % 10 == 0:
             logger.log_scalar("train/loss", float(np.mean(recent_losses)), global_step)
             recent_losses = []
 
@@ -148,7 +149,7 @@ def validate(model: nn.Module,
         losses.append(loss.item())
         probabilities.extend(torch.sigmoid(logits.float()).cpu().numpy())  # the model returns logits
         targets.extend(masks.cpu().numpy())
-        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        pbar.set_postfix({"loss": f"{losses[-1]:.4f}"})
 
     dataset = _segmentation_dataset(loader)
     dice = raw_dice_per_patient(probabilities, targets, dataset.flat_index, dataset.patient_ids)

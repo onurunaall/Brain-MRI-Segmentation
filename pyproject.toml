@@ -23,7 +23,9 @@ package = false
 [dependency-groups]
 dev = ["pytest>=8.0", "mypy>=2.3"]
 # ONNX export (torch.export-based exporter) and ONNX Runtime inference; for GPU inference replace
-# onnxruntime with onnxruntime-gpu (the two packages must not be installed together)
+# onnxruntime with onnxruntime-gpu (the two packages must not be installed together). PyPI's onnxruntime-gpu is built
+# for CUDA 13; with a CUDA 12 build of PyTorch install it with --extra-index-url
+# https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
 onnx = ["onnx>=1.23", "onnxscript>=0.7", "onnxruntime>=1.23"]
 # TensorRT 11.3 runtime and builder (CUDA 13 wheels, matching the default PyTorch wheels; use tensorrt-cu12 with a
 # CUDA 12 build of PyTorch)
