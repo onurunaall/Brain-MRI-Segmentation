@@ -1,0 +1,13 @@
+{
+  "arch": "swinunetr",
+  "fold": 2,
+  "seed": 0,
+  "epochs": 100,
+  "compile": "default",
+  "best_val_dice": 0.7776768662005843,
+  "best_epoch": 47,
+  "train_seconds_total": 1682.0313035119325,
+  "seconds_per_epoch": 16.820313035119327,
+  "peak_train_memory_mb": 2620.92333984375,
+  "n_params": 6310315
+}

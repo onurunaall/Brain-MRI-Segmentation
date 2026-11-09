@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies (CPU build of PyTorch)
+        run: |
+          uv venv --python 3.12
+          uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          uv pip install -r pyproject.toml --group dev --group onnx
+
+      - name: pytest
+        run: .venv/bin/python -m pytest -q
+
+      - name: mypy
+        run: .venv/bin/python -m mypy .

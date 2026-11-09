@@ -1,313 +1,239 @@
-# Brain MRI FLAIR Abnormality Segmentation
+# Brain MRI tumour segmentation: U-Net vs ResU-Net vs Swin-UNETR
 
-U-Net trained on the [LGG Segmentation Dataset](https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation) to automatically delineate FLAIR signal abnormalities in brain MRI. Trained and evaluated on the TCGA lower-grade glioma cohort.
+[![tests](https://github.com/onurunaall/Brain-MRI-Segmentation/actions/workflows/tests.yml/badge.svg)](https://github.com/onurunaall/Brain-MRI-Segmentation/actions/workflows/tests.yml)
+![Python 3.10-3.12](https://img.shields.io/badge/python-3.10--3.12-blue)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
----
+I built this project on my own time to learn medical image segmentation properly, end to end: from TIFF slices on
+disk to a cross-validated comparison of three architectures, and models exported for ONNX Runtime and TensorRT. The
+task is to outline FLAIR abnormalities (lower-grade gliomas) in brain MRI, using the
+[LGG Segmentation Dataset](https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation): 110 patients from The
+Cancer Genome Atlas, with manual tumour masks.
 
-## Architecture
-
-![U-Net Architecture](assets/unet_architecture.png)
-
-Standard U-Net with four encoder stages, a bottleneck, and four symmetric decoder stages with skip connections. Each encoder/decoder stage is a double conv block: `Conv3×3 → BN → ReLU → Conv3×3 → BN → ReLU`. Decoder stages upsample via transposed convolution and concatenate the matching encoder features before the double conv.
-
-| Stage | Feature maps | Spatial resolution |
-|---|---|---|
-| Encoder 1 | 32 | 256 × 256 |
-| Encoder 2 | 64 | 128 × 128 |
-| Encoder 3 | 128 | 64 × 64 |
-| Encoder 4 | 256 | 32 × 32 |
-| Bridge | 512 | 16 × 16 |
-| Decoder 4 | 256 | 32 × 32 |
-| Decoder 3 | 128 | 64 × 64 |
-| Decoder 2 | 64 | 128 × 128 |
-| Decoder 1 | 32 | 256 × 256 |
-| Output head | 1 (logit; sigmoid applied in the loss and at inference) | 256 × 256 |
-
----
-
-## Dataset
-
-The [LGG Segmentation Dataset](https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation) contains brain MRI scans from 110 patients with lower-grade glioma from The Cancer Genome Atlas (TCGA). Each patient folder has multi-sequence MRI (pre-contrast T1, FLAIR, post-contrast T1) with expert-annotated tumour masks. The model takes all three channels of a slice as input, plus the three channels of one neighbouring slice on each side (2.5D input, `--context-slices 1`, 9 channels; neighbours beyond the first or last slice are filled with background), and predicts a single binary segmentation mask for the middle slice. The neighbours tell the model where in the head it is, which matters at the skull base and the top of the head.
-
-**Split:** 100 patients training / 10 patients validation (random, seed 42).
-
----
+The question I wanted to answer was simple: on a dataset this small, does a transformer-based model actually beat a
+plain U-Net once the evaluation is done carefully? In my runs it does not. A residual U-Net ties with the plain U-Net,
+and Swin-UNETR is clearly worse, mostly because of a handful of patients where it fails badly.
 
 ## Results
 
-### Per-patient Dice coefficient
+Every patient is tested exactly once, by a model that never saw it during training: patient-level 5-fold
+cross-validation, with 22 test patients, 78 training patients and 10 validation patients (to pick the checkpoint) per
+fold. All three architectures use the same folds, loss, schedule and augmentation. Scores are measured in the
+original image pixels against the masks on disk, every slice included.
 
-![Dice Distribution](assets/dice_distribution.png)
+| | U-Net | ResU-Net | Swin-UNETR |
+|---|---|---|---|
+| Mean Dice ± SD over patients | **0.837** ± 0.132 | **0.838** ± 0.121 | 0.797 ± 0.185 |
+| Median Dice | 0.882 | 0.874 | 0.862 |
+| Worst patient | 0.267 | 0.452 | 0.000 |
+| Patients below 0.5 | 6 | 4 | 9 |
+| Mean Dice without post-processing | 0.832 | 0.835 | 0.791 |
+| Median HD95 (pixels) | 2.0 | 2.0 | 2.0 |
+| Difference to U-Net (Wilcoxon signed-rank) | | +0.0004 (p = 0.71) | -0.041 (p < 0.001) |
+| SD of the five fold means | 0.034 | 0.034 | 0.035 |
+| Parameters | 7.8 M | 8.1 M | 6.3 M |
+| Peak training memory | 1.4 GB | 1.7 GB | 2.6 GB |
+| Training time per epoch (RTX A6000) | 17 s | 16 s* | 17 s |
 
-| Metric | Value |
-|---|---|
-| Mean DSC | ~0.90 |
-| Median DSC | ~0.92 |
+110 test patients per architecture, one training seed per fold (15 training runs, 100 epochs each). I am rerunning
+everything with three seeds per fold, so the comparison also covers seed-to-seed noise; these numbers will be updated
+when it finishes. The raw per-patient results are in [`results/`](results/).
 
-Performance is strong across the board — nine of ten validation patients score above 0.88, with the top four (DU_6404, CS_6667, DU_6408, DU_5851) all exceeding 0.93. The one weaker result is HT_7616 at roughly 0.80, which has a large tumour with diffuse, irregular margins that extend across multiple lobes. The model handles it reasonably but predictably undershoots on the infiltrating edges. This kind of case is genuinely harder and the score reflects that honestly.
+\* ResU-Net folds 0 to 2 ran while someone else was using the same GPU on our shared workstation (56 to 74 s per
+epoch), so this is the mean of folds 3 and 4.
 
-### Sample predictions
+![Dice and HD95 per patient](assets/results/metric_distributions.png)
 
-![Sample predictions](assets/predictions_grid.png)
+### What I learned from it
 
-*Red contour = prediction · Green contour = ground truth*
+**ResU-Net and U-Net are a tie.** Compared patient by patient, ResU-Net is better on 49 patients and worse on 55, with
+a mean difference of +0.0004. At this data size the residual blocks did not buy anything.
 
-Left to right: HT_7879 and DU_5851 show near-perfect contour agreement on compact, well-defined lesions. HT_7616 (slice 23) demonstrates the same on a smaller lesion. HT_7616 (slice 19) is the harder case — the model tracks the tumour core correctly but the ground truth extends further into the surrounding diffuse signal, which is where the gap in that patient's overall Dice score comes from.
+**Swin-UNETR loses on the hard cases, not on the typical one.** Its median is only 0.02 below U-Net's, but it has
+more outright failures (9 patients below 0.5 against 6), which pulls its mean down by 0.04. It is worse than U-Net on
+67 of the 110 patients. My guess is that 78 training patients are too few for a transformer trained from scratch, and
+that the learning rate and schedule I used for all three models suit the convolutional ones better. I have not tested
+that guess.
 
----
+![Per-patient Dice of each architecture against U-Net](assets/results/paired_dice_vs_baseline.png)
 
-## Training curves
+**Small tumours are the hardest.** The 9 patients with the smallest tumours (under 5,000 voxels on the 256 × 256 grid)
+average a Dice of 0.67 with U-Net, against 0.85 for everyone else. A small tumour has few pixels compared to its
+boundary, so every boundary pixel the model gets wrong costs more. ResU-Net held up best there (0.76).
 
-*(TensorBoard logs — coming soon)*
+![Dice against tumour size](assets/results/dice_vs_tumour_volume.png)
 
----
+**Post-processing helps on average and can wreck a single case.** After thresholding, the prediction can be cleaned
+up by dropping small 3D blobs or by keeping only the largest connected component. Each model picks the option that
+works best on its 10 validation patients. On average this adds 0.003 to 0.006 Dice. But Swin-UNETR on fold 4 picked
+"largest component only" (validation Dice 0.735 against 0.723 without), and on patient TCGA_DU_6405 its largest
+component was a confident false positive around the lateral ventricles. The real tumour, which it had partly found,
+was deleted, and the patient's Dice went from 0.245 to 0.000:
 
-## Quickstart
+![Swin-UNETR failure on TCGA_DU_6405](assets/results/swinunetr_lcc_failure_DU_6405.png)
 
-### 1. Install dependencies
+A choice made on 10 patients over a difference of 0.01 is mostly noise. A safer rule would only pick the more
+destructive option when it wins clearly.
 
-```bash
-pip install torch torchvision medpy scikit-image matplotlib tqdm tensorboard pillow kagglehub
-# or: uv sync
+**The sudden drop in the loss curves is not what it looks like.** U-Net's validation loss falls from about 0.7 to 0.13
+around epoch 40 (ResU-Net around epoch 28), and the validation Dice does not move at all.
 
-# Optional, for ONNX export / ONNX Runtime and for TensorRT 11.3 engines (NVIDIA GPU):
-uv sync --group onnx --group tensorrt
-```
+![Training curves](assets/results/training_curves.png)
 
-### 2. Download data
+The loss is soft Dice plus binary cross-entropy, computed per slice. On a slice without tumour, the soft Dice term with
+a smoothing constant of 1 is 1 - 1/(sum of probabilities + 1). That stays close to 1 until the probabilities over the
+whole slice add up to less than about one pixel's worth. More than half of the validation slices have no tumour, so
+they contribute roughly 0.5 to 0.6 to the loss until the network pushes those probabilities almost exactly to zero,
+and then the term collapses. Thresholded at 0.5, nothing about the segmentation changes. Swin-UNETR never gets there in 100 epochs,
+which is why its validation loss stays at 0.65. This is the reason I select checkpoints on validation Dice and not on
+the loss.
 
-```bash
-python get_data.py
-```
+### What the segmentations look like
 
-### 3. Train
+Worst, median and best test patients, ranked by the mean Dice of the three models. Green is correct, red is a false
+positive, blue is missed tumour.
 
-```bash
-python -m mriseg.train \
-  --data-dir ./kaggle_3m \
-  --epochs 100 \
-  --lr 1e-4 \
-  --batch-size 16 \
-  --device cuda:0 \
-  --compile default        # torch.compile mode: none | default | reduce-overhead | max-autotune | max-autotune-no-cudagraphs
-```
+![Worst, median and best test patients](assets/results/segmentation_overview.png)
 
-The best checkpoint is saved to `./checkpoints/best_model.pt` whenever validation Dice improves (per patient,
-thresholded at 0.5, without post-processing). It is always saved from the uncompiled model, so it loads with or without
-`torch.compile`. The checkpoint also holds the record of how it was trained (architecture, image size, context slices,
-fold, seed and the training / validation / test patients); `predict.py` and `export_models.py` read every setting from
-it, so they cannot get a setting wrong or score the model on its own training patients.
+## How it works
 
-Training samples slices so that half of each patient's weight follows tumour area and half is spread over all its
-slices: tumour-free slices are about 30% of training samples, so the model learns to predict nothing on them.
+**Data.** Each patient is a stack of 256 × 256 slices with three channels (pre-contrast T1, FLAIR, post-contrast T1)
+and a manual mask of the FLAIR abnormality. The model sees the slice plus one neighbouring slice on each side (9 input
+channels, "2.5D"), which tells it where in the head it is. That matters at the skull base and the top of the head.
 
-### 4. Run inference
+**Preprocessing.** Drop the first and last slice, crop to the head, pad to a square, resize to 256 × 256 (bicubic for
+the image, nearest-exact for the mask), then clip each channel to its 1st to 99th percentile and standardise it, with
+the statistics taken from head voxels only.
 
-```bash
-python -m mriseg.predict \
-  --model-path ./checkpoints/best_model.pt \
-  --split validation \
-  --data-dir ./kaggle_3m \
-  --output-dir ./predictions \
-  --figure-path ./assets/dice_distribution.png
-```
+**Training.** Adam with learning rate 1e-4 and cosine decay, 100 epochs, batch size 16, mixed precision and
+torch.compile. The loss is soft Dice plus binary cross-entropy. Slices are sampled so that half of a patient's weight
+follows tumour area and half is spread evenly, which makes about 30% of the training samples tumour-free, so the
+model also learns to predict nothing. Augmentation: scale ±5%, rotation ±15°, horizontal flip, and per-sequence
+brightness and gamma changes.
 
-`--split validation` / `test` scores the model's own validation / test patients, read from its checkpoint (a model
-trained without `--fold` has no test patients). The validation patients chose the checkpoint, so their score is
-optimistic; the honest score is `--split test` of a `--fold` model. `--split all` predicts every patient in
-`--data-dir` (new patients; they need no `*_mask.tif` files).
+**Models**, all written from scratch in [`mriseg/network.py`](mriseg/network.py):
+- U-Net: four encoder and four decoder stages with skip connections, 32 to 512 feature maps.
+- ResU-Net: the same layout and widths, with residual blocks.
+- Swin-UNETR (2D): a Swin transformer encoder (feature size 24, window 8, depths 2-2-2-2) with a convolutional decoder.
 
-The backend follows the model file: `.pt` → PyTorch (add `--compile` and/or `--amp` for torch.compile / fp16
-autocast), `.onnx` → ONNX Runtime, `.engine` / `.plan` → TensorRT. Exported files take their settings from the
-`model.pt` next to them (as `export_models.py` writes them). Checkpoints from older versions of `train.py` hold only
-weights and are refused: retrain them.
+<details>
+<summary>U-Net architecture diagram</summary>
 
-Dice and HD95 are measured in original pixels: the prediction is mapped back onto the original slices and compared
-with the `*_mask.tif` files, every slice included (also the first and last, which the model never sees).
-`--masks-dir DIR` writes the predicted masks the same way, as `DIR/<patient>/<slice>_pred.tif` in the size of the
-input slices.
+![U-Net architecture](assets/unet_architecture.png)
+</details>
 
-`--postprocess` sets the connected-component filtering of the thresholded prediction: `none`, `drop-small` (drop 3D
-components smaller than 10% of the largest) or `lcc` (keep only the largest 3D component). The default `auto` picks
-the one with the best mean Dice on the model's validation patients and records it in the results JSON. `lcc` used
-to be fixed, but it deletes the whole tumour when a false-positive blob is larger, and it always deletes separate
-lesions.
+**Evaluation.** Predictions are mapped back to the original pixels and scored per patient in 3D: Dice, and the 95th
+percentile Hausdorff distance (HD95) in pixels, with one slice step counted as one pixel because the TIFF files carry
+no physical spacing. Architectures are compared per patient against U-Net with a Wilcoxon signed-rank test.
 
-### 5. Compare architectures (K-fold CV)
+## Mistakes I found and fixed along the way
 
-```bash
-bash run_cv.sh            # trains + tests every arch/fold, runs aggregate.py and compare.py, bundles models into ./models
-python -m mriseg.compare --runs-dir ./runs --baseline unet   # redraw figures any time, no GPU or dataset needed
-```
+Getting a number out of this pipeline was quick. Getting a number I trust took most of the time. These are the things
+I got wrong at first:
 
-`run_cv.sh` reads `ARCHS`, `FOLDS`, `SEEDS` (default `0 1 2`: three training seeds per fold, so architecture
-differences can be told apart from seed noise), `EPOCHS`, `CONTEXT_SLICES` (default 1), `DATA_DIR`, `RUNS_DIR`,
-`MODELS_DIR`, `COMPILE` (torch.compile mode for training, default `default`) and `EXPORT_FORMATS` (see
-[ONNX and TensorRT](#8-onnx-and-tensorrt)) from the environment, e.g.
-`COMPILE=none EXPORT_FORMATS="fp32.onnx fp16.engine" bash run_cv.sh`. Finished runs are skipped, so train with changed
-settings into a new folder, e.g. `RUNS_DIR=./runs_v2 MODELS_DIR=./models_v2 bash run_cv.sh`.
+- **Masks shifted by half a pixel.** I resized masks with PyTorch's `"nearest"` mode, which samples slightly off
+  centre. Masks written back to disk came out one pixel down and to the right, and augmentation shifted every
+  training label half a pixel against its image. `"nearest-exact"` fixes both, and the tests now check exact round
+  trips.
+- **Normalisation depended on the background.** The intensity statistics included the black area around the head, so
+  the same tissue got different values depending on how much background a scan had. They now use head voxels only.
+- **Scoring on the wrong grid.** I first measured Dice on the resized 256 × 256 grid and skipped the first and last
+  slice. Predictions are now mapped back to the original pixels and every slice counts.
+- **"Keep the largest component" deleted real tumours.** It used to be a fixed step, but it throws away the whole
+  tumour whenever a false positive is bigger, and it always removes separate lesions. It is now one option, chosen per
+  model on validation patients (and the failure above shows it still bites).
+- **An optimistic headline number.** An earlier version of this README reported a mean Dice of about 0.90, measured on
+  the same 10 validation patients that chose the checkpoint. The cross-validated 0.84 above is lower, and honest.
+- **Settings in three places.** The model's settings used to live in the command line, a config file and the
+  checkpoint. Now the checkpoint carries its own record (architecture, input size, which patients it was trained,
+  validated and tested on), so `predict.py` cannot score a model on its own training patients by mistake.
 
-Per run, `runs/<arch>/fold<k>_seed<s>/` holds `test_results.json` (per-patient Dice after the chosen post-processing,
-Dice without post-processing and HD95, all in original pixels; the chosen method and its validation scores are in
-`meta`), `test_masks.npz` (FLAIR, ground truth, predicted mask and probability map per test patient, on the
-preprocessed grid), `logs/history.csv` (per-epoch losses, val Dice, lr, time) and the checkpoint. A run whose training
-finished but whose test did not is only tested again. In `summary.csv`, a patient whose tumour one seed missed
-entirely gets an infinite HD95 (counted in `hd95_undefined_count`), so a miss is never averaged away.
-
-`compare.py` writes to `runs/figures/`:
-
-| File | Shows |
-|---|---|
-| `metric_distributions.png` | Per-patient Dice and HD95 per architecture (box + individual patients) |
-| `paired_dice_vs_baseline.png` | Each patient's Dice for an architecture vs the baseline; above the diagonal = better |
-| `fold_mean_dice.png` | Mean test Dice per fold and architecture |
-| `dice_vs_tumour_volume.png` | Per-patient Dice against ground-truth tumour size |
-| `training_curves.png` | Train loss, val loss and val Dice per epoch (mean ± std over folds) |
-| `segmentation_overview.png` | Worst / median / best test patients side by side for every architecture |
-| `segmentation/<patient>.png` | Per patient: largest-tumour, most-errors and tumour-edge slices; columns FLAIR, ground truth, each architecture |
-| `<arch>/all_patients.png` | Gallery of one architecture: every test patient on its largest-tumour slice, lowest Dice first |
-| `<arch>/cases/<worstN\|medianN\|bestN>_<patient>.png` | The `--gallery-cases` (default 3) worst, median and best patients of one architecture: several slices with FLAIR, ground truth, prediction errors and the probability map |
-
-Overlay colours: green = correct, red = false positive, blue = missed, yellow = ground truth.
-The per-patient figures draw the masks of one seed per fold (`--seed`, default the lowest) and show that run's Dice.
-
-### 6. Saved models for later prediction (fold ensembles)
-
-K-fold CV trains one model per fold, and each fold's test Dice is measured on patients that model never saw.
-`export_models.py` (run at the end of `run_cv.sh`) copies all fold models of an architecture into one bundle:
-
-```
-models/<arch>/manifest.json            # arch, image size, context slices; per member: fold, seed, val Dice, best epoch (0-based), held-out test Dice, chosen post-processing
-models/<arch>/fold<k>_seed<s>/model.pt # plus model.fp32.onnx, model.fp16.engine, ... when exported
-```
-
-`predict.py --bundle-dir` averages the probabilities of all members (a K-fold ensemble), on new patients in the
-Kaggle folder layout:
+## Running it
 
 ```bash
-python -m mriseg.predict --bundle-dir ./models/unet --split all --postprocess lcc --data-dir ./new_patients --output-dir ./new_predictions
-python -m mriseg.predict --bundle-dir ./models/unet --bundle-file model.fp16.engine --split all --postprocess lcc --data-dir ./new_patients
+git clone https://github.com/onurunaall/Brain-MRI-Segmentation.git
+cd Brain-MRI-Segmentation
+uv sync                   # Python 3.10-3.12; add --group onnx / --group tensorrt for the exports
+source .venv/bin/activate
+python get_data.py        # downloads the Kaggle dataset into ./kaggle_3m
+bash run_cv.sh            # 3 architectures x 5 folds x 3 seeds -> runs/summary.csv, runs/figures/, models/
 ```
 
-`--split all` has no validation patients to choose the post-processing on, so pass it explicitly: use the method most
-members chose (`postprocess` per member in `manifest.json`; `lcc` above is only an example).
-
-The ensemble is refused on `--split validation/test`: every CV patient was a training patient of the other folds'
-models, so any score there would be inflated. The CV results in `summary.csv` estimate the performance of a single
-fold model; the ensemble has no held-out estimate of its own.
-Add `--masks-dir DIR` to save the ensemble's masks in the size of the input slices.
-
-### 7. torch.compile
-
-`--compile MODE` (train.py, predict.py, benchmark.py) wraps the model with `torch.compile`; `none` runs eager PyTorch.
-Training compiles by default (as before); prediction and benchmarking run eagerly by default.
-
-* **Same model, not bit-identical numbers.** Inductor fuses operations and picks different kernels, so outputs differ
-  from eager mode at the level of floating-point rounding (measured on CPU: max |Δp| 6e-8 for U-Net and 8e-7 for
-  Swin-UNETR in fp32, no pixel changed class at the 0.5 threshold). Test Dice is therefore essentially unchanged.
-* **Training runs diverge slightly.** Those rounding differences compound over thousands of optimizer steps, so a
-  compiled and an eager training run with the same seed end at slightly different weights, like two runs with
-  non-deterministic cuDNN kernels. Compare architectures with the same compile mode.
-* **Speed.** The first batches are slow while compiling (35-85 s per architecture measured on CPU; switching to eval
-  mode and a smaller last batch each trigger a recompile), later steps are usually faster on GPU. `reduce-overhead` adds CUDA
-  graphs (more memory), `max-autotune` benchmarks kernels (much longer compile).
-* `bash run_backend_eval.sh` with `VARIANTS=compile` measures the test Dice of every fold model with torch.compile.
-
-### 8. ONNX and TensorRT
+`run_cv.sh` takes about 30 minutes per training run on one RTX A6000 and can be restarted: finished runs are skipped.
+To train or score a single model, or to predict new patients with a fold ensemble:
 
 ```bash
-EXPORT_FORMATS="fp32.onnx fp16.onnx fp32.engine fp16.engine" bash run_cv.sh   # or, after training:
-python -m mriseg.export_models --runs-dir ./runs --out-dir ./models --formats fp32.onnx fp16.onnx fp32.engine fp16.engine --overwrite
-bash run_backend_eval.sh    # test Dice per backend -> runs/summary.<variant>.csv
-python -m mriseg.benchmark --backends pytorch fp32.onnx fp32.engine fp16.engine --out ./runs/compute_benchmark.json
+python -m mriseg.train --arch unet --fold 0 --seed 0
+python -m mriseg.predict --model-path ./checkpoints/best_model.pt --split test --results-json test_results.json
+python -m mriseg.predict --bundle-dir ./models/unet --split all --postprocess lcc --data-dir ./new_patients --masks-dir ./new_masks
 ```
 
-* **ONNX:** exported with PyTorch's `torch.export`-based exporter (opset 20, dynamic batch, fixed H × W).
-  `fp16.onnx` is an fp16 copy of the model (weights, activations, input and output).
-* **TensorRT 11.3:** TensorRT 11 networks are always strongly typed (the FP16 builder flag no longer exists), so the
-  engine precision comes from the ONNX file: `fp16.engine` is built from `fp16.onnx`. `fp32.engine` lets
-  convolutions use TF32 tensor cores (TensorRT's default; `--no-tf32` disables it). Engines accept batch sizes 1 to
-  `--max-batch` (default 32; larger batches are split) and only run with the TensorRT version and GPU model they were
-  built with, so rebuild them on each machine.
-* After each export, `export_models.py` prints the largest probability difference to the fp32 PyTorch model on a
-  random batch as a sanity check; `run_backend_eval.sh` gives the real accuracy comparison on the test folds.
-* The TensorRT path requires an NVIDIA GPU and was written against the TensorRT 11.3 Python API; its test
-  (`tests/test_export_models.py::test_tensorrt_engine_matches_pytorch`) is skipped on machines without one.
+The trained models can be exported to ONNX (fp32 / fp16) and TensorRT engines, and `run_backend_eval.sh` measures how
+much each backend changes the test Dice. Everything else (all options, output files, fold ensembles, torch.compile,
+ONNX / TensorRT and the compute benchmark) is in [docs/usage.md](docs/usage.md).
 
-### 9. Run tests
+## Project layout
+
+```
+mriseg/
+  dataset.py        patient discovery, K-fold split, preprocessing, the slice Dataset
+  network.py        U-Net, ResU-Net, Swin-UNETR
+  losses.py         soft Dice + BCE
+  augmentations.py  scale, rotation, flip, brightness, gamma
+  train.py          training loop, checkpoint with its training record
+  predict.py        inference (PyTorch, ONNX Runtime, TensorRT, fold ensembles) and scoring
+  evaluation.py     Dice and HD95 in original pixels
+  aggregate.py      cross-validation summary and Wilcoxon tests
+  compare.py        comparison figures and per-patient galleries
+  inference.py      checkpoints and inference backends
+  export_models.py  model bundles, ONNX export, TensorRT engines
+  benchmark.py      parameters, FLOPs, latency and memory per backend
+  utils.py          geometry, normalisation, post-processing, drawing
+run_cv.sh           cross-validation for every architecture, then summary, figures and export
+run_backend_eval.sh test Dice of every fold model under torch.compile, fp16, ONNX and TensorRT
+results/            raw per-patient results behind the numbers above
+tests/              pytest suite (synthetic data, no dataset needed)
+get_data.py         downloads the dataset
+hubconf.py          torch.hub entry point
+visualize_net_arch.py  draws the U-Net diagram
+```
+
+## Tests
 
 ```bash
-uv sync --group onnx   # pytest and mypy are in the dev dependency group
-pytest                 # ~50 s on CPU; synthetic data only, no dataset needed. ONNX tests skip without the onnx group
-mypy .                 # every function must be fully type-annotated (see [tool.mypy] in pyproject.toml)
+uv sync --group onnx
+pytest     # 167 tests on synthetic data, about 2 minutes on a CPU
+mypy .     # the code is fully type-annotated
 ```
 
----
+The tests cover the geometry round trips (crop, pad, resize and back), the metrics, the patient splits, the
+augmentations, the checkpoint record, the backends and the exports. They run on every push with GitHub Actions.
 
-## Configuration
+## Limitations and what I would try next
 
-All training hyperparameters are saved to `./tb_logs/config.json` at the start of each run.
+- One training seed per fold so far (the three-seed rerun is in progress).
+- Only 10 validation patients choose both the checkpoint and the post-processing, which is noisy: Swin-UNETR's fold 4
+  model was picked at epoch 9 of 100.
+- All three models share one set of hyperparameters, and Swin-UNETR gets no pretraining.
+- 2.5D input instead of a full 3D model, and HD95 in pixels rather than millimetres.
+- All 110 patients come from one source (TCGA), so there is no external test set.
+- Next: a Dice term computed over the whole batch (or skipped on empty slices) to remove the loss cliff, a more
+  conservative post-processing rule, and a 3D model.
 
-| Parameter | Default | Description |
-|---|---|---|
-| `batch_size` | 16 | Training batch size |
-| `epochs` | 100 | Number of training epochs |
-| `lr` | 1e-4 | Initial learning rate (cosine annealing) |
-| `image_size` | 256 | Spatial resolution after preprocessing |
-| `aug_scale` | 0.05 | Random scale range ±5% |
-| `aug_angle` | 15.0 | Random rotation ±15° |
-| `aug_brightness` | 0.2 | Per-channel intensity factor in [0.8, 1.2] (scanner / site differences) |
-| `aug_gamma` | 0.4 | Per-channel gamma in [1/1.4, 1.4] (contrast between tissues) |
-| `context_slices` | 1 | Neighbouring slices on each side as extra input channels (2.5D); 0 = plain 2D |
-| `compile` | default | `torch.compile` mode, or `none` for eager PyTorch |
+For context, the authors of the dataset report a mean Dice of 82% with their own segmentation setup (Buda et al.,
+2019). Their protocol differs from mine, so the numbers are not directly comparable.
 
----
+## Dataset and citation
 
-## Project structure
+The data come from The Cancer Genome Atlas (TCGA) and The Cancer Imaging Archive (TCIA), prepared as the LGG
+Segmentation Dataset by Mateusz Buda. If you use the data, please cite:
 
-```
-.
-├── mriseg/
-│   ├── train.py          # Training loop with TensorBoard logging; saves the checkpoint with its training record
-│   ├── predict.py        # Inference (PyTorch / ONNX Runtime / TensorRT, single model or fold ensemble), scoring
-│   ├── inference.py      # Checkpoints, inference backends, torch.compile helper, fold-ensemble loading
-│   ├── export_models.py  # Per-architecture model bundles, ONNX export, TensorRT engine build
-│   ├── benchmark.py      # Parameters, FLOPs, latency and memory per architecture and backend
-│   ├── evaluation.py     # Per-patient metrics in original pixels (Dice, HD95) and results JSON
-│   ├── aggregate.py      # CV summary table with Wilcoxon tests against the baseline
-│   ├── compare.py        # Comparison figures across architectures and per-architecture galleries
-│   ├── dataset.py        # Patient discovery, splits, preprocessing, MRISegmentationDataset (slice-level Dataset)
-│   ├── network.py        # UNetModel, ResUNetModel, SwinUNETRModel and the architecture registry
-│   ├── losses.py         # SoftDiceLoss, DiceBCELoss
-│   ├── augmentations.py  # Random scale / rotation / flip / brightness / gamma pipeline
-│   ├── utils.py          # Crop / pad / resize / normalize and their inverse, Dice, post-processing, drawing
-│   └── tb_logger.py      # TensorBoard wrapper
-├── run_cv.sh             # K-fold CV for every architecture, then aggregate, compare and export
-├── run_backend_eval.sh   # Test Dice of every fold model with torch.compile / ONNX / TensorRT
-├── tests/                # pytest unit tests (metrics, preprocessing, splits, aggregation, figures, backends, export)
-├── get_data.py           # Kaggle dataset download utility
-├── hubconf.py            # torch.hub entry point
-├── visualize_net_arch.py # Draws assets/unet_architecture.png
-└── assets/
-    ├── unet_architecture.png
-    ├── dice_distribution.png
-    └── predictions_grid.png
-```
-
----
-
-## Loss function
-
-Training uses **Soft Dice Loss plus binary cross-entropy** on the same logits (as in nnU-Net). The Dice term is computed per-sample and per-channel:
-
-$$\mathcal{L}_{Dice} = 1 - \frac{1}{N} \sum_{i=1}^{N} \frac{2 \sum p_i \cdot g_i + \epsilon}{\sum p_i + \sum g_i + \epsilon}$$
-
-where $p_i$ are predicted probabilities and $g_i$ are binary ground-truth labels. Laplace smoothing $\epsilon = 1$ prevents division by zero on empty slices — most brain slices contain no tumour at all.
-
-On a tumour-free slice the Dice term is $1 - 1/(\sum p_i + 1)$. Its gradient vanishes once a false-positive blob is predicted, so Dice alone cannot remove such blobs. The BCE term gives every wrong pixel a gradient, so the total loss is $\mathcal{L} = \mathcal{L}_{Dice} + \mathcal{L}_{BCE}$. The networks therefore return logits; the sigmoid is applied in the loss and at inference, and exported ONNX / TensorRT models include it.
-
----
+- M. Buda, A. Saha, M. A. Mazurowski. "Association of genomic subtypes of lower-grade gliomas with shape features
+  automatically extracted by a deep learning algorithm." *Computers in Biology and Medicine* 109 (2019): 218-225.
+- M. A. Mazurowski, K. Clark, N. M. Czarnek, P. Shamsesfandabadi, K. B. Peters, A. Saha. "Radiogenomics of lower-grade
+  glioma: algorithmically-assessed tumor shape is associated with tumor genomic subtypes and patient outcomes in a
+  multi-institutional study with The Cancer Genome Atlas data." *Journal of Neuro-Oncology* 133(1) (2017): 27-35.
 
 ## License
 
-MIT
+[MIT](LICENSE)
